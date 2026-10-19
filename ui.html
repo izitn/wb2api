@@ -27,7 +27,7 @@ input[type=text],input[type=password],textarea,select{font:inherit;font-size:12p
 .tabs{display:flex;align-items:center;gap:4px;border-bottom:1px solid var(--border);margin-bottom:12px;flex-wrap:wrap}.tabs button{border:0;background:transparent;border-radius:0;padding:8px 11px;color:var(--muted);font-size:11px;border-bottom:2px solid transparent}.tabs button.on{color:var(--accent);border-bottom-color:var(--accent)}.two-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-auto-rows:1fr;gap:14px;align-items:stretch}.two-columns>.card{margin:0}.kv{margin-bottom:14px;min-width:0}.kv>label{display:block;color:var(--muted);font-size:11px;margin-bottom:7px}.kv .val{display:flex;gap:8px;align-items:center;min-width:0}.kv .val>input,.kv .val>textarea,.kv .val>select{flex:1;min-width:0}.kv .val input{font-family:var(--mono);font-size:11px}.code-output{background:var(--panel2);border-color:var(--border);padding:12px;min-height:180px}.switch-row{display:flex;align-items:center;justify-content:space-between;gap:25px}.switch{position:relative;display:inline-flex;flex:none}.switch input{appearance:none;margin:0;width:34px;height:20px;background:var(--border2);border-radius:20px;position:relative;transition:background .15s}.switch input:after{content:"";position:absolute;left:3px;top:3px;width:14px;height:14px;border-radius:50%;background:white;box-shadow:0 1px 3px #0002;transition:transform .15s}.switch input:checked{background:var(--accent)}.switch input:checked:after{transform:translateX(14px)}.settings-section{padding-top:14px;margin-top:14px;border-top:1px solid var(--border)}
 .footer{display:flex;justify-content:space-between;gap:15px;color:var(--faint);font-size:10px;margin:18px 0 0}.footer span{display:flex;gap:5px;align-items:center}.spin{display:inline-block;width:11px;height:11px;border:1.5px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px}@keyframes spin{to{transform:rotate(360deg)}}
 .refreshing{animation:spin 1s linear infinite}.balance-number{overflow-wrap:anywhere}.account-meta{flex-wrap:wrap}.error-text .dot{color:var(--error)}
-.startup-control{padding-bottom:12px;margin-bottom:12px;border-bottom:1px solid var(--border);font-size:11px}.startup-control .switch-row{gap:8px}.startup-control .status-line{font-size:10px}.points-auto{border-top:1px solid var(--border);margin-top:8px;padding-top:8px;font-size:11px}.points-auto .switch-row{gap:8px}.points-auto label[for=auto-checkin]{cursor:help;text-decoration:underline dotted var(--faint);text-underline-offset:4px}.points-auto .status-line{font-size:10px}.today-card{display:flex;flex-direction:column}.today-card .metric-bottom{margin-top:auto;padding-top:10px}
+.startup-control{padding-bottom:12px;margin-bottom:12px;border-bottom:1px solid var(--border);font-size:11px}.startup-control .switch-row{gap:8px}.startup-control .status-line{font-size:10px}.pool-info{padding-bottom:12px;margin-bottom:12px;border-bottom:1px solid var(--border);font-size:11px}.pool-info .switch-row{gap:8px;justify-content:space-between}.pool-info .status-line{font-size:10px}.pool-badge{font-size:10px;padding:1px 6px;border-radius:9px;border:1px solid var(--border);color:var(--muted);white-space:nowrap}.pool-badge.ok{color:var(--ok,#1a7f37);border-color:currentColor}.pool-badge.warn{color:var(--warn,#9a6700);border-color:currentColor}.pool-badge.off{color:var(--faint);border-color:currentColor}.points-auto{border-top:1px solid var(--border);margin-top:8px;padding-top:8px;font-size:11px}.points-auto .switch-row{gap:8px}.points-auto label[for=auto-checkin]{cursor:help;text-decoration:underline dotted var(--faint);text-underline-offset:4px}.points-auto .status-line{font-size:10px}.today-card{display:flex;flex-direction:column}.today-card .metric-bottom{margin-top:auto;padding-top:10px}
 @media(prefers-color-scheme:dark){:root{--bg:#171c20;--panel:#20262c;--panel2:#262d34;--sidebar:#1c2227;--border:#303840;--border2:#424c56;--text:#e8ecef;--muted:#a0aab5;--faint:#71808c;--accent:#86caa6;--accent-bg:#263e34;--accent-line:#446d57;--ok:#86caa6;--ok-bg:#263e34;--warn:#e9b467;--warn-bg:#413424;--error:#f29c9c;--shadow:none}}
 @media(min-width:1600px){.wrap{padding-top:24px}.summary-grid>.card{padding:16px}.scroll{max-height:650px}}
 @media(max-width:1180px){.sidebar{width:184px;padding-left:12px;padding-right:12px}.app-main{margin-left:184px}.wrap{padding:18px 20px}.topbar{padding:0 20px}.two-columns{grid-template-columns:1fr}.heading-date{display:none}}
@@ -58,7 +58,8 @@ input[type=text],input[type=password],textarea,select{font:inherit;font-size:12p
     <button type="button" data-view="usage" onclick="showView('usage')"><svg class="icon"><use href="#i-chart"/></svg>用量统计</button>
   </nav>
   <div class="sidebar-foot">
-    <div class="startup-control"><div class="switch-row"><label for="startup-enabled">wb2api 开机自启</label><label class="switch"><input type="checkbox" id="startup-enabled" aria-label="wb2api 开机自启" onchange="setStartup()"></label></div><p class="status-line" id="startup-status" role="status" aria-live="polite"></p></div>
+    <div class="startup-control"><div class="switch-row"><label for="startup-enabled" title="Windows 写入当前用户启动项；Linux 写入 systemd 用户单元。">wb2api 开机自启</label><label class="switch"><input type="checkbox" id="startup-enabled" aria-label="wb2api 开机自启" onchange="setStartup()"></label></div><p class="status-line" id="startup-status" role="status" aria-live="polite"></p></div>
+    <div class="pool-info"><div class="switch-row"><label>账号池</label><span class="pool-badge" id="pool-badge">—</span></div><p class="status-line" id="pool-status" role="status" aria-live="polite"></p></div>
     <div class="connection-label"><span class="dot" id="connection-dot"></span><span id="connection-text">正在连接服务</span></div>
     <p>OpenAI / Anthropic 接口<br>国际版 / 国内版账户</p>
   </div>
@@ -354,6 +355,41 @@ function renderAccountTools(){
   $('#startup-enabled').checked = !!s.enabled;
   $('#startup-enabled').disabled = s.supported === false || startupSaving;
   $('#startup-status').textContent = s.message || '正在读取 wb2api 自启设置…';
+  renderPool();
+}
+
+function renderPool(){
+  const pool = STATE && STATE.pool;
+  const badge = $('#pool-badge'), line = $('#pool-status');
+  if(!badge || !line) return;
+  if(!pool){
+    badge.textContent = '—'; badge.className = 'pool-badge off';
+    line.textContent = '账号池不可用';
+    return;
+  }
+  if(pool.enabled === false){
+    badge.textContent = '已关闭'; badge.className = 'pool-badge off';
+    line.textContent = '账号池已关闭（WB_POOL=0），请求只使用当前账户';
+    return;
+  }
+  const cn = pool.cn || {}, intl = pool.global || {};
+  const total = (cn.count || 0) + (intl.count || 0);
+  const available = (cn.available || 0) + (intl.available || 0);
+  if(!total){
+    badge.textContent = '无账户'; badge.className = 'pool-badge off';
+    line.textContent = '尚未保存账户';
+    return;
+  }
+  const parts = [];
+  if(cn.count) parts.push('国内版 ' + cn.available + '/' + cn.count);
+  if(intl.count) parts.push('国际版 ' + intl.available + '/' + intl.count);
+  const switching = (pool.stats && pool.stats.switch) || 0;
+  const healthy = available === total;
+  badge.textContent = healthy ? '可用' : '部分冷却';
+  badge.className = 'pool-badge ' + (healthy ? 'ok' : 'warn');
+  line.textContent = parts.join(' · ') + ' 可用' +
+    (switching ? ' · 已自动换号 ' + switching + ' 次' : '');
+  line.classList.toggle('error-text', available === 0);
 }
 function acceptPoints(p, aid){
   if(!STATE || STATE.activeAccountId !== aid) return false;
