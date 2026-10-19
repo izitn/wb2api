@@ -1,0 +1,834 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>wb2api · 管理控制台</title>
+<style>
+:root{--bg:#f5f6f8;--panel:#fff;--panel2:#f8f9fb;--sidebar:#fcfcfd;--border:#e7e9ee;--border2:#d9dde5;--text:#202730;--muted:#78808d;--faint:#a0a6b0;--accent:#28775a;--accent-bg:#eaf4ee;--accent-line:#bcdbca;--ok:#28775a;--ok-bg:#eaf4ee;--warn:#ad6c20;--warn-bg:#fff5e4;--error:#b64d4d;--shadow:0 3px 14px #232b3503;--mono:ui-monospace,"Cascadia Code","SFMono-Regular",Consolas,monospace}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 "Segoe UI",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+button,input,select,textarea{font:inherit}button,a,input,select,textarea{-webkit-tap-highlight-color:transparent}button{cursor:pointer}button:disabled{cursor:default;opacity:.45}button,a,input,select,textarea,summary{outline-offset:4px}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid var(--accent)}
+.hidden,[hidden]{display:none!important}.icon{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex:none}.sprite{position:absolute;width:0;height:0;overflow:hidden}
+.sidebar{width:192px;position:fixed;inset:0 auto 0 0;background:var(--sidebar);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:22px 14px 18px;z-index:10}
+.brand{display:flex;align-items:center;gap:11px;padding:0 11px;color:var(--text);text-decoration:none}.brand-mark{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--accent);color:var(--panel);font-family:var(--mono);font-size:21px;font-weight:700;letter-spacing:-5px;padding-right:5px}.brand strong{font-size:19px;letter-spacing:-.6px}.brand small{color:var(--muted);font-size:10px;font-weight:500;margin-left:5px}
+.nav-caption{margin:28px 12px 10px;color:var(--faint);font-size:10px;letter-spacing:1.5px}.nav{display:grid;gap:7px}.nav button{display:flex;align-items:center;gap:13px;border:0;background:transparent;color:var(--muted);font-size:13px;text-align:left;padding:10px 12px;border-radius:8px}.nav button:hover{background:var(--panel2);color:var(--text)}.nav button.active{background:var(--accent-bg);color:var(--accent);font-weight:600}.nav button.active:after{content:"";width:5px;height:5px;margin-left:auto;background:currentColor;border-radius:50%}
+.sidebar-foot{margin-top:auto;padding:18px 11px 0}.sidebar-foot p{font-size:11px;color:var(--muted);margin:12px 0 0;line-height:1.9}.connection-label{display:flex;align-items:center;gap:8px;font-size:12px}.dot{display:inline-block;width:6px;height:6px;flex:none;border-radius:50%;background:currentColor}.connection-label .dot{color:var(--ok);box-shadow:0 0 0 4px var(--ok-bg)}
+.app-main{margin-left:192px;min-width:0}.topbar{height:52px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 26px;background:var(--panel)}.breadcrumb{display:flex;align-items:center;gap:14px;font-size:12px;color:var(--muted)}.breadcrumb span:last-child{color:var(--text)}.topbar-status{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--ok)}.topbar-status .dot{width:5px;height:5px}
+.wrap{max-width:1440px;padding:20px 26px;margin:auto}.page-heading{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:16px}h1{font-size:24px;letter-spacing:-1px;font-weight:650;margin:0 0 5px}.sub{font-size:12px;color:var(--muted);margin:0}.heading-date{color:var(--muted);font-size:12px;white-space:nowrap}
+.summary-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-bottom:18px;align-items:stretch}.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow);min-width:0;padding:16px;margin-bottom:14px}.summary-grid>.card{margin:0;padding:14px 16px}.card.dim{opacity:.72}.card-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}.eyebrow{font-size:11px;font-weight:500;color:var(--muted)}h2{margin:0;font-size:15px;letter-spacing:-.2px;font-weight:650}h3{margin:0;font-size:13px;font-weight:600}.card-description{color:var(--muted);font-size:12px;margin:4px 0 0}.card-header{display:flex;align-items:flex-start;gap:16px;justify-content:space-between;margin-bottom:14px}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grow{flex:1;min-width:0}.sp{flex:1}.note{font-size:11px;color:var(--muted);line-height:1.8;margin:10px 0 0;overflow-wrap:anywhere}.note:empty{display:none}.note b{font-weight:500;color:var(--text)}a{color:var(--accent)}.status-line{font-size:11px;line-height:1.7;color:var(--muted);margin:8px 0 0;overflow-wrap:anywhere}.status-line:empty{display:none}.error-text{color:var(--error)!important}
+button{border:1px solid var(--border2);background:var(--panel);color:var(--text);border-radius:7px;padding:6px 11px;font-size:12px;white-space:nowrap;display:inline-flex;align-items:center;justify-content:center;gap:7px;transition:background .15s,border-color .15s}button:hover:not(:disabled){background:var(--panel2);border-color:var(--faint)}button.primary{background:var(--accent);border-color:var(--accent);color:var(--panel)}button.primary:hover:not(:disabled){background:var(--accent);filter:brightness(1.1)}button.sm{padding:5px 10px;font-size:11px}.icon-button{padding:6px;border:0;background:transparent;color:var(--muted)}.icon-button .icon{width:16px;height:16px}.text-button{padding:3px 0;border:0;background:transparent;color:var(--accent);font-size:11px}.text-button:hover:not(:disabled){background:transparent}.text-button .icon{width:14px;height:14px}.pill{display:inline-flex;align-items:center;gap:5px;border-radius:5px;font-size:10px;font-weight:500;background:var(--panel2);padding:3px 7px;color:var(--muted);white-space:nowrap}.pill.ok{color:var(--ok);background:var(--ok-bg)}.pill.warn{color:var(--warn);background:var(--warn-bg)}
+.account-person{display:flex;gap:9px;align-items:center}.avatar{height:36px;width:36px;display:grid;place-items:center;border:1px solid var(--accent-line);border-radius:50%;background:var(--accent-bg);color:var(--accent);font-size:17px;font-weight:600;flex:none}.account-name{font-size:17px;line-height:1.4;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.account-meta{margin-top:4px;font-size:10px;color:var(--muted);display:flex;align-items:center;gap:7px}.account-select-wrap{margin-top:12px;display:flex;align-items:center;gap:10px}.account-select-wrap label{font-size:11px;color:var(--muted);white-space:nowrap}.account-select-wrap select{font-size:11px;padding:6px 28px 6px 9px;min-width:0}.login-title{font-size:17px;margin:0 0 5px;font-weight:600}.login-note{font-size:11px;color:var(--muted);margin:0 0 15px}
+.points-card{background:var(--panel);position:relative}.points-card:before{content:"";height:3px;background:var(--accent-line);position:absolute;top:-1px;left:22px;right:22px;border-radius:3px}.balance-number{font-size:30px;font-weight:600;letter-spacing:-1.4px;font-variant-numeric:tabular-nums;line-height:1.25;min-height:36px;margin-top:3px}.points-unit{font-size:10px;color:var(--muted);margin:4px 0 0}.points-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:8px;border-top:1px solid var(--border);padding-top:8px}.points-footer .status-line{margin:0;font-size:10px}.points-detail{font-size:10px;color:var(--muted);min-height:16px;overflow-wrap:anywhere;margin-top:4px}.points-detail.error-text{line-height:1.5}.usage-number{font-size:30px;letter-spacing:-1px;font-variant-numeric:tabular-nums;line-height:1.25;font-weight:600}.usage-number small{font-size:11px;font-weight:400;color:var(--muted);letter-spacing:0;margin-left:6px}.metric-bottom{display:flex;align-items:center;justify-content:space-between;gap:5px;font-size:10px;color:var(--muted);margin-top:10px}
+.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}.search-field{display:flex;align-items:center;gap:9px;border:1px solid var(--border2);border-radius:7px;padding-left:11px;flex:1;min-width:160px;max-width:350px;color:var(--muted);background:var(--panel)}.search-field .icon{width:16px;height:16px}.search-field input{border:0;background:transparent;min-width:0;padding:7px 10px 7px 0;width:100%;font-size:12px;color:var(--text)}.search-field:focus-within{border-color:var(--accent)}.search-field input:focus{outline:none}.toolbar select{width:auto;min-width:145px;font-size:11px}.quick-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:12px}.quick-actions button{background:var(--panel2);border-color:transparent;padding:4px 10px;font-size:10px;color:var(--muted)}.quick-actions button:hover:not(:disabled){color:var(--accent);background:var(--accent-bg)}.quick-actions .cheap-button{color:var(--accent);background:var(--accent-bg)}.quick-label{font-size:10px;color:var(--muted);margin-right:4px}.model-status{display:flex;align-items:center;gap:8px;margin-left:auto;font-size:10px;color:var(--muted)}
+input[type=text],input[type=password],textarea,select{font:inherit;font-size:12px;padding:7px 10px;border-radius:7px;border:1px solid var(--border2);background:var(--panel);color:var(--text);width:100%}input[type=checkbox]{accent-color:var(--accent);width:14px;height:14px;vertical-align:middle;cursor:pointer}input::placeholder,textarea::placeholder{color:var(--faint)}textarea{font-family:var(--mono);font-size:11px;line-height:1.65;resize:vertical}select{cursor:pointer}code,.mono{font-family:var(--mono);font-size:.92em}
+.tablebox{border:1px solid var(--border);border-radius:8px;overflow:hidden}.scroll{max-height:560px;overflow:auto}table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;font-size:10px;letter-spacing:.3px;font-weight:500;color:var(--muted);background:var(--panel2);padding:8px 12px;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:1}td{padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:middle}tr:last-child td{border-bottom:0}tbody tr:hover{background:var(--panel2)}tr.sel{background:color-mix(in srgb,var(--accent-bg) 45%,var(--panel))}td.c,th.c{text-align:center;width:42px;padding-left:12px;padding-right:6px}td.id{font-family:var(--mono);font-size:11px;overflow-wrap:anywhere}td.num{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}.model-identity{display:flex;align-items:center;gap:9px}.model-glyph{width:26px;height:26px;display:grid;place-items:center;background:var(--panel2);color:var(--muted);border:1px solid var(--border);border-radius:8px;flex:none;font:600 12px "Segoe UI",sans-serif}.model-name{color:var(--text);font-weight:500;font-size:12px}.model-subtitle{font:10px/1.6 "Segoe UI","Microsoft YaHei",sans-serif;color:var(--muted);margin-top:2px}.credits{font-family:var(--mono);font-size:11px;white-space:nowrap}.credits s{color:var(--faint);margin-right:4px}.free-factor{color:var(--accent);background:var(--accent-bg);border-radius:4px;padding:3px 7px;font-size:10px}.tag{display:inline-block;font:9px/1.5 "Segoe UI","Microsoft YaHei",sans-serif;border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--muted);margin-left:4px;vertical-align:middle}.empty{padding:44px 15px;text-align:center;color:var(--muted);font-size:12px}.table-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:10px;font-size:10px;color:var(--muted)}
+.tabs{display:flex;align-items:center;gap:4px;border-bottom:1px solid var(--border);margin-bottom:12px;flex-wrap:wrap}.tabs button{border:0;background:transparent;border-radius:0;padding:8px 11px;color:var(--muted);font-size:11px;border-bottom:2px solid transparent}.tabs button.on{color:var(--accent);border-bottom-color:var(--accent)}.two-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-auto-rows:1fr;gap:14px;align-items:stretch}.two-columns>.card{margin:0}.kv{margin-bottom:14px;min-width:0}.kv>label{display:block;color:var(--muted);font-size:11px;margin-bottom:7px}.kv .val{display:flex;gap:8px;align-items:center;min-width:0}.kv .val>input,.kv .val>textarea,.kv .val>select{flex:1;min-width:0}.kv .val input{font-family:var(--mono);font-size:11px}.code-output{background:var(--panel2);border-color:var(--border);padding:12px;min-height:180px}.switch-row{display:flex;align-items:center;justify-content:space-between;gap:25px}.switch{position:relative;display:inline-flex;flex:none}.switch input{appearance:none;margin:0;width:34px;height:20px;background:var(--border2);border-radius:20px;position:relative;transition:background .15s}.switch input:after{content:"";position:absolute;left:3px;top:3px;width:14px;height:14px;border-radius:50%;background:white;box-shadow:0 1px 3px #0002;transition:transform .15s}.switch input:checked{background:var(--accent)}.switch input:checked:after{transform:translateX(14px)}.settings-section{padding-top:14px;margin-top:14px;border-top:1px solid var(--border)}
+.footer{display:flex;justify-content:space-between;gap:15px;color:var(--faint);font-size:10px;margin:18px 0 0}.footer span{display:flex;gap:5px;align-items:center}.spin{display:inline-block;width:11px;height:11px;border:1.5px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px}@keyframes spin{to{transform:rotate(360deg)}}
+.refreshing{animation:spin 1s linear infinite}.balance-number{overflow-wrap:anywhere}.account-meta{flex-wrap:wrap}.error-text .dot{color:var(--error)}
+.startup-control{padding-bottom:12px;margin-bottom:12px;border-bottom:1px solid var(--border);font-size:11px}.startup-control .switch-row{gap:8px}.startup-control .status-line{font-size:10px}.points-auto{border-top:1px solid var(--border);margin-top:8px;padding-top:8px;font-size:11px}.points-auto .switch-row{gap:8px}.points-auto label[for=auto-checkin]{cursor:help;text-decoration:underline dotted var(--faint);text-underline-offset:4px}.points-auto .status-line{font-size:10px}.today-card{display:flex;flex-direction:column}.today-card .metric-bottom{margin-top:auto;padding-top:10px}
+@media(prefers-color-scheme:dark){:root{--bg:#171c20;--panel:#20262c;--panel2:#262d34;--sidebar:#1c2227;--border:#303840;--border2:#424c56;--text:#e8ecef;--muted:#a0aab5;--faint:#71808c;--accent:#86caa6;--accent-bg:#263e34;--accent-line:#446d57;--ok:#86caa6;--ok-bg:#263e34;--warn:#e9b467;--warn-bg:#413424;--error:#f29c9c;--shadow:none}}
+@media(min-width:1600px){.wrap{padding-top:24px}.summary-grid>.card{padding:16px}.scroll{max-height:650px}}
+@media(max-width:1180px){.sidebar{width:184px;padding-left:12px;padding-right:12px}.app-main{margin-left:184px}.wrap{padding:18px 20px}.topbar{padding:0 20px}.two-columns{grid-template-columns:1fr}.heading-date{display:none}}
+@media(max-width:760px){.sidebar{position:static;width:auto;padding:15px 18px 0;border-right:0;border-bottom:1px solid var(--border);gap:14px}.brand{padding:0}.brand-mark{height:29px;width:29px;font-size:18px}.brand strong{font-size:17px}.nav-caption{display:none}.nav{grid-template-columns:repeat(3,minmax(0,1fr));gap:3px}.nav button{padding:11px 5px;justify-content:center;gap:6px;border-radius:7px 7px 0 0;font-size:11px}.nav button.active:after{display:none}.nav .icon{width:16px;height:16px}.app-main{margin-left:0}.topbar{height:47px;padding:0 20px}.topbar-status{font-size:10px}.wrap{padding:16px 14px}.page-heading{margin-bottom:14px}h1{font-size:23px}.summary-grid{gap:10px;margin-bottom:16px}.summary-grid>.card{padding:12px 14px}.summary-grid{grid-template-columns:1fr;grid-auto-rows:1fr}.points-detail{font-size:9px}.card{padding:14px}.toolbar{gap:8px}.toolbar .search-field{max-width:none;flex-basis:100%}.toolbar select{flex:1;min-width:0}.quick-actions{gap:5px}.model-status{width:100%;margin-left:0}.scroll{max-height:510px}#card-models table{min-width:540px}#card-usage .tablebox{overflow-x:auto}#card-usage table{min-width:650px}.table-footer{align-items:flex-start;flex-direction:column}.card-header{gap:8px}.footer{flex-direction:column;gap:4px}.sub{font-size:11px}.tabs button{padding:8px;font-size:10px}.kv .val{flex-wrap:wrap}.kv .val>input{min-width:120px}.points-card .card-heading{gap:2px}.sidebar-foot{display:block;margin:0;padding:0}.sidebar-foot>.connection-label,.sidebar-foot>p{display:none}.startup-control{border:0;margin:0;padding:0 0 12px}.startup-control .switch-row{justify-content:flex-start;gap:12px}.startup-control .status-line{margin-top:5px}.points-auto .switch input{width:30px;height:18px}.points-auto .switch input:after{width:12px;height:12px}.points-auto .switch input:checked:after{transform:translateX(12px)}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}.spin,.refreshing{animation:none}}
+@media(max-width:1180px) and (min-width:761px){.startup-control .switch-row{align-items:flex-start;flex-direction:column}}
+@media(min-width:761px) and (max-width:1000px){.summary-grid{grid-template-columns:1fr;grid-auto-rows:1fr}}
+</style>
+</head>
+<body>
+<svg class="sprite" aria-hidden="true"><defs>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="m10 13 4-4m-6 6-1 1a4.2 4.2 0 0 1-6-6l4-4a4.2 4.2 0 0 1 6 0m2 2 1-1a4.2 4.2 0 0 1 6 6l-4 4a4.2 4.2 0 0 1-6 0" transform="translate(1 1)"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 4v16h17M9 15v-4m5 4V7m5 8v-5"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6.1 6.1A8 8 0 0 1 20 12M4 12a8 8 0 0 0 13.9 5.9"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M15 8V4H4v11h4"/></symbol>
+</defs></svg>
+<aside class="sidebar">
+  <a class="brand" href="#models" onclick="showView('models')"><span class="brand-mark" aria-hidden="true">w.</span><span><strong>wb2api</strong><small>lite</small></span></a>
+  <div class="nav-caption">工作空间</div>
+  <nav class="nav" aria-label="主导航">
+    <button type="button" data-view="models" class="active" aria-current="page" onclick="showView('models')"><svg class="icon"><use href="#i-grid"/></svg>模型管理</button>
+    <button type="button" data-view="access" onclick="showView('access')"><svg class="icon"><use href="#i-link"/></svg>接入配置</button>
+    <button type="button" data-view="usage" onclick="showView('usage')"><svg class="icon"><use href="#i-chart"/></svg>用量统计</button>
+  </nav>
+  <div class="sidebar-foot">
+    <div class="startup-control"><div class="switch-row"><label for="startup-enabled">wb2api 开机自启</label><label class="switch"><input type="checkbox" id="startup-enabled" aria-label="wb2api 开机自启" onchange="setStartup()"></label></div><p class="status-line" id="startup-status" role="status" aria-live="polite"></p></div>
+    <div class="connection-label"><span class="dot" id="connection-dot"></span><span id="connection-text">正在连接服务</span></div>
+    <p>OpenAI / Anthropic 接口<br>国际版 / 国内版账户</p>
+  </div>
+</aside>
+<main class="app-main">
+  <header class="topbar"><div class="breadcrumb"><span>工作空间</span><span aria-hidden="true">/</span><span id="breadcrumb-current">模型管理</span></div><span class="topbar-status" id="service-status"><span class="dot"></span>正在连接</span></header>
+  <div class="wrap">
+    <div class="page-heading"><div><h1 id="page-title">模型管理</h1><p class="sub" id="page-description">为你的工具，挑选合适的模型。</p></div><span class="heading-date" id="current-date"></span></div>
+    <div class="summary-grid">
+      <section class="card account-card" id="card-login" aria-label="当前账户">
+        <div class="card-heading"><span class="eyebrow">当前账户</span><button class="text-button" type="button" onclick="chooseLogin()" id="account-add"><svg class="icon"><use href="#i-plus"/></svg>添加账户</button></div>
+        <div id="login-out">
+          <p class="login-title">连接你的第一个账户</p>
+          <p class="login-note" id="login-choice-label">选择版本，在授权页面完成登录。</p>
+          <div class="row"><button class="primary sm" onclick="doLogin('global')">登录国际版</button><button class="sm" onclick="doLogin('cn')">登录国内版</button><button id="login-cancel" class="hidden sm" onclick="cancelLogin()">取消</button></div>
+        </div>
+        <div id="login-in" class="hidden">
+          <div class="account-person"><span class="avatar" id="account-avatar" aria-hidden="true">W</span><div class="grow"><div id="acct-info" class="account-name"></div><div class="account-meta"><span class="pill ok" id="account-realm">已连接</span><span id="account-expiry"></span></div></div><span class="pill ok"><span class="dot"></span>使用中</span></div>
+        </div>
+        <div id="account-switcher" class="hidden">
+          <div class="account-select-wrap"><label for="account-select">切换账户</label><select id="account-select" aria-label="选择后立即切换账户" onchange="switchAccount()"></select></div>
+          <div id="account-status" class="status-line" role="status" aria-live="polite"></div>
+        </div>
+        <div id="login-wait" class="hidden">
+          <p class="status-line"><span class="spin"></span> <span id="login-progress" role="status">正在申请授权…</span></p>
+          <div class="row"><button class="text-button" onclick="chooseLogin()">重新选择版本</button><a id="auth-link" class="hidden note" href="#" target="_blank" rel="noreferrer">打开授权页面</a></div>
+        </div>
+      </section>
+      <section class="card points-card" id="card-account-tools" aria-label="当前账户积分">
+        <div class="card-heading"><span class="eyebrow">可用积分</span><button id="points-refresh" class="icon-button" aria-label="刷新当前账户积分" title="刷新积分" onclick="loadPoints()"><svg class="icon"><use href="#i-refresh"/></svg></button></div>
+        <div class="balance-number" id="points-balance" aria-live="polite">—</div>
+        <p class="points-unit" id="points-owner">登录后自动获取余额</p>
+        <div class="points-detail" id="points-detail" role="status"></div>
+        <div class="points-footer"><span id="checkin-status" class="status-line">签到状态：未查询</span><button id="checkin-submit" class="text-button" onclick="checkin()">签到领积分 <svg class="icon"><use href="#i-arrow"/></svg></button></div>
+        <div class="points-auto"><div class="switch-row"><label for="auto-checkin" title="为已保存的国内版个人账户签到，需保持代理运行。">每日自动签到</label><label class="switch"><input type="checkbox" id="auto-checkin" aria-label="每日自动签到领积分" onchange="setAutoCheckin()"></label></div><p class="status-line error-text" id="auto-checkin-status" role="status" aria-live="polite"></p></div>
+      </section>
+      <section class="card today-card" aria-label="今日用量概览">
+        <div class="card-heading"><span class="eyebrow">今日请求</span><svg class="icon" style="color:var(--muted);width:16px;height:16px"><use href="#i-chart"/></svg></div>
+        <div class="usage-number"><span id="today-requests">0</span><small>次</small></div>
+        <div class="points-unit">累计消耗 <span id="today-credits">0</span> 积分</div>
+        <p class="note" style="margin-top:12px">涵盖所有账户的代理请求</p>
+        <div class="metric-bottom"><span>来自本地请求记录</span><button class="text-button" onclick="showView('usage')">查看用量 →</button></div>
+      </section>
+    </div>
+
+    <div class="view-panel" id="view-models">
+      <section class="card" id="card-models">
+        <div class="card-header"><div><h2>模型目录</h2><p class="card-description">勾选按账户自动保存，切换账户时同步切换。</p></div><span id="sel-count" class="pill"></span></div>
+        <div class="toolbar">
+          <label class="search-field"><svg class="icon"><use href="#i-search"/></svg><input type="search" id="q" aria-label="搜索模型" placeholder="搜索模型名称…" oninput="renderModels()"></label>
+          <span class="sp"></span>
+          <select id="model-sort" aria-label="模型排序" onchange="renderModels()"><option value="default">目录默认顺序</option><option value="credits-asc">倍率：从低到高</option><option value="credits-desc">倍率：从高到低</option></select>
+          <button onclick="loadModels(true)"><svg class="icon" style="width:14px;height:14px"><use href="#i-refresh"/></svg>同步目录</button>
+        </div>
+        <div class="quick-actions"><span class="quick-label">快速选择</span><button class="cheap-button" onclick="bulk('cheap')" title="选择当前搜索结果中倍率为 0～1 的模型，含限时优惠">低倍率 ≤1</button><button onclick="bulk('all')">全选</button><button onclick="bulk('invert')">反选</button><button onclick="bulk('none')">清空</button><span class="model-status" role="status" aria-live="polite"><span id="save-status"></span><button id="save-retry" class="hidden sm" onclick="retrySave()">重试保存</button></span></div>
+        <div class="tablebox"><div class="scroll"><table><thead><tr><th class="c"><span class="hidden">选择</span></th><th>模型名称</th><th style="width:110px">积分倍率</th><th style="width:100px;text-align:right">上下文</th><th style="width:100px;text-align:right">最大输出</th></tr></thead><tbody id="tbody"></tbody></table></div></div>
+        <div class="table-footer"><span id="models-status" role="status"></span><span>倍率包含有效优惠 · 零倍率可参与筛选</span></div>
+      </section>
+      <p class="note">仅展示倍率明确的模型，包含零倍率与有效优惠。每个账户单独记住勾选。</p>
+    </div>
+
+    <div class="view-panel hidden" id="view-access">
+      <div class="two-columns">
+        <section class="card" id="card-access">
+          <div class="card-header"><div><h2>连接到你的工具</h2><p class="card-description">填入接口地址和密钥，使用所选模型。</p></div><span class="pill">OpenAI / Anthropic</span></div>
+          <div class="kv"><label for="out-base">接口地址</label><div class="val"><input id="out-base" type="text" readonly><button class="sm" onclick="copyEl('out-base',this)">复制</button></div></div>
+          <div class="kv"><label for="out-key">访问密钥</label><div class="val"><input id="out-key" type="password" readonly><button class="icon-button" id="key-toggle" aria-label="显示访问密钥" onclick="toggleKey()">显示</button><button class="sm" onclick="copyEl('out-key',this)">复制</button></div></div>
+          <div class="settings-section"><h3>支持的接口</h3><p class="note mono">POST /v1/chat/completions<br>POST /v1/responses<br>POST /v1/messages<br>GET /v1/models</p><p class="note">上方地址可用于 OpenAI SDK。Anthropic SDK 使用去掉末尾 /v1 的地址；两者均使用本地访问密钥。</p></div>
+        </section>
+        <section class="card" id="card-out">
+          <div class="card-header"><div><h2>快捷配置</h2><p class="card-description">按你的客户端格式复制配置。</p></div></div>
+          <div class="tabs"><button class="on" data-tab="names" onclick="tab('names')">模型列表</button><button data-tab="codex" onclick="tab('codex')">Codex</button><button data-tab="anthropic" onclick="tab('anthropic')">Anthropic</button><button data-tab="json" onclick="tab('json')">JSON</button><button data-tab="env" onclick="tab('env')">环境变量</button></div>
+          <textarea class="code-output" id="out-text" aria-label="客户端配置" rows="8" readonly></textarea>
+          <div class="row" style="margin-top:10px"><span class="grow note" style="margin:0" id="out-hint"></span><button class="sm" onclick="copyEl('out-text',this)"><svg class="icon" style="width:13px;height:13px"><use href="#i-copy"/></svg>复制内容</button></div>
+        </section>
+      </div>
+    </div>
+
+    <div class="view-panel hidden" id="view-usage">
+      <section class="card" id="card-usage">
+        <div class="card-header"><div><h2>请求用量</h2><p class="card-description">所有账户经本代理发起的请求记录。</p></div><span id="usage-sum" class="pill"></span></div>
+        <div class="tabs"><button class="on" data-utab="today" onclick="utab('today')">今日</button><button data-utab="month" onclick="utab('month')">本月</button><span class="sp"></span><button onclick="loadUsage()"><svg class="icon" style="width:13px;height:13px"><use href="#i-refresh"/></svg>刷新</button></div>
+        <div id="usage-status" class="status-line" role="status"></div>
+        <div class="tablebox"><table><thead><tr><th>模型</th><th>请求</th><th>失败</th><th>输入词元</th><th>输出词元</th><th>消耗积分</th><th>加权用量</th></tr></thead><tbody id="usage-body"></tbody></table></div>
+        <p class="note">消耗积分来自上游返回的用量；加权用量 = 倍率 × 千词元，仅供横向比较。上游未返回用量时，零值不代表没有消耗。</p>
+      </section>
+    </div>
+
+    <footer class="footer"><span>wb2api lite <span aria-hidden="true">·</span> 本地模型工作空间</span><span>账户选择即切换，积分自动更新</span></footer>
+  </div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+let STATE = null, CATALOG = {models:[], promotions:[]}, SELECTED = new Set(), TAB = 'names', UTAB = 'today', USAGE = null;
+
+const VIEWS = {
+  models:['模型管理','为你的工具，挑选合适的模型。'],
+  access:['接入配置','连接本地接口，让模型进入你的工作流。'],
+  usage:['用量统计','查看请求记录，了解模型的实际消耗。'],
+};
+function showView(name, updateHash = true){
+  if(!Object.hasOwn(VIEWS, name)) name = 'models';
+  document.querySelectorAll('.view-panel').forEach(el => el.classList.toggle('hidden', el.id !== 'view-' + name));
+  document.querySelectorAll('[data-view]').forEach(el => {
+    el.classList.toggle('active', el.dataset.view === name);
+    if(el.dataset.view === name) el.setAttribute('aria-current','page');
+    else el.removeAttribute('aria-current');
+  });
+  $('#breadcrumb-current').textContent = $('#page-title').textContent = VIEWS[name][0];
+  $('#page-description').textContent = VIEWS[name][1];
+  if(updateHash && location.hash !== '#' + name) location.hash = name;
+}
+window.addEventListener('hashchange', () => showView(location.hash.slice(1), false));
+function toggleKey(){
+  const visible = $('#out-key').type === 'password';
+  $('#out-key').type = visible ? 'text' : 'password';
+  $('#key-toggle').textContent = visible ? '隐藏' : '显示';
+  $('#key-toggle').setAttribute('aria-label', visible ? '隐藏访问密钥' : '显示访问密钥');
+}
+
+async function api(path, opts){
+  const pwd = new URLSearchParams(location.search).get('pwd');
+  const headers = {'Content-Type':'application/json', ...((opts || {}).headers || {})};
+  if(pwd) headers['Authorization'] = 'Bearer ' + pwd;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 45000);
+  try{
+    const r = await fetch(path, {cache:'no-store', ...opts, headers, signal:controller.signal});
+    let j;
+    try { j = await r.json(); }
+    catch { throw new Error('服务返回了无法解析的数据（HTTP ' + r.status + '）'); }
+    if(!r.ok) throw new Error((j.error && j.error.message) || j.message || ('请求失败（HTTP ' + r.status + '）'));
+    return j;
+  }catch(e){
+    if(e.name === 'AbortError') throw new Error('请求超时，请稍后重试');
+    if(e instanceof TypeError) throw new Error('无法连接服务，请确认代理正在运行');
+    throw e;
+  }finally{ clearTimeout(timer); }
+}
+
+function copyEl(id, btn){
+  const el = document.getElementById(id);
+  const txt = el.value !== undefined ? el.value : el.textContent;
+  const done = () => { const o = btn.textContent; btn.textContent = '已复制'; setTimeout(()=>btn.textContent=o, 1200); };
+  if(navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(txt).then(done, () => fallback(txt, done));
+  } else fallback(txt, done);
+}
+function fallback(txt, done){
+  const ta = document.createElement('textarea');
+  ta.value = txt; ta.style.position='fixed'; ta.style.opacity='0';
+  document.body.appendChild(ta); ta.select();
+  try { if(!document.execCommand('copy')) throw new Error(); done(); }
+  catch(e){ alert('复制失败，请选中内容后手动复制'); }
+  document.body.removeChild(ta);
+}
+
+function fmtNum(n){
+  if(n === null || n === undefined || n === '') return '—';
+  if(n >= 1000000) return (n/1000000).toFixed(n%1000000?1:0) + 'M';
+  if(n >= 1000) return Math.round(n/1000) + 'K';
+  return String(n);
+}
+
+/* ---------- 登录 ---------- */
+let loginGeneration = 0, loginChoosing = false, loginBusy = false, accountSwitching = false;
+function chooseLogin(){
+  if(accountSwitching) return;
+  loginGeneration++;
+  loginBusy = false;
+  loginChoosing = true;
+  $('#login-wait').classList.add('hidden');
+  renderLogin();
+}
+function cancelLogin(){
+  loginGeneration++;
+  loginChoosing = loginBusy = false;
+  $('#login-wait').classList.add('hidden');
+  renderLogin();
+}
+async function doLogin(realm){
+  if(accountSwitching) return;
+  const generation = ++loginGeneration;
+  loginChoosing = false;
+  loginBusy = true;
+  renderLogin();
+  $('#login-wait').classList.remove('hidden');
+  $('#auth-link').classList.add('hidden');
+  const label = realm === 'cn' ? '国内版' : '国际版';
+  $('#login-progress').textContent = '正在申请' + label + '授权…';
+  // 在点击事件中预开页面，避免异步请求完成后被浏览器拦截。
+  const popup = window.open('about:blank', '_blank');
+  if(popup) popup.opener = null;
+  try{
+    await flushSelections();
+    const d = await api('/admin/login', {method:'POST', body: JSON.stringify({realm})});
+    if(generation !== loginGeneration){ if(popup) popup.close(); return; }
+    const authUrl = new URL(d.authUrl);
+    if(!['https:', 'http:'].includes(authUrl.protocol)) throw new Error('授权地址格式不正确');
+    $('#auth-link').href = authUrl.href;
+    $('#auth-link').classList.remove('hidden');
+    $('#login-progress').textContent = '等待完成' + label + '授权…';
+    if(popup && !popup.closed) popup.location.href = authUrl.href;
+    await pollLogin(d.state, generation);
+  }catch(e){
+    if(popup && !popup.closed) popup.close();
+    if(generation !== loginGeneration) return;
+    cancelLogin();
+    alert('登录失败：' + e.message);
+  }
+}
+async function pollLogin(state, generation){
+  let lastError = '';
+  const deadline = Date.now() + 300000;
+  while(Date.now() < deadline){
+    await new Promise(r => setTimeout(r, 3000));
+    if(generation !== loginGeneration) return;
+    let d;
+    try { d = await api('/admin/login/poll?state=' + encodeURIComponent(state)); }
+    catch(e){
+      if(generation !== loginGeneration) return;
+      lastError = e.message;
+      $('#login-progress').textContent = '暂时无法确认授权状态，正在重试：' + lastError;
+      continue;
+    }
+    if(generation !== loginGeneration) return;
+    if(d.status === 'done'){
+      loginBusy = false;
+      $('#login-wait').classList.add('hidden');
+      CATALOG = {models:[], promotions:[]};
+      modelsGeneration++;
+      await refreshState();
+      return;
+    }
+    if(d.status === 'timeout' || d.status === 'expired') throw new Error(d.message || '授权已失效，请重试');
+    lastError = '';
+    $('#login-progress').textContent = '等待你在授权页面完成登录…';
+  }
+  if(generation === loginGeneration) throw new Error(lastError || '授权超时，请重新选择版本并登录');
+}
+
+function renderLogin(){
+  const on = !!(STATE && STATE.loggedIn);
+  $('#login-out').classList.toggle('hidden', loginBusy || (on && !loginChoosing));
+  $('#login-cancel').classList.toggle('hidden', !on);
+  $('#login-in').classList.toggle('hidden', !on || loginBusy || loginChoosing);
+  $('#account-add').disabled = accountSwitching || loginBusy;
+  $('.login-title').textContent = on ? '添加另一个账户' : '连接你的第一个账户';
+  if(on){
+    const a = STATE.account || {};
+    const name = a.displayName || a.nickname || '未命名账号';
+    $('#acct-info').textContent = name;
+    $('#acct-info').title = a.uid ? '账号 ID：' + a.uid : '';
+    $('#account-avatar').textContent = Array.from(name)[0].toUpperCase();
+    $('#account-realm').textContent = (STATE.realm === 'global' ? '国际版' : '国内版') + (a.enterpriseId ? ' · 企业' : ' · 个人');
+    $('#account-expiry').textContent = a.expiresAt ? new Date(a.expiresAt*1000).toLocaleDateString('zh-CN') + ' 到期' : '';
+    $('#account-expiry').title = a.expiresAt ? '授权到期时间：' + new Date(a.expiresAt*1000).toLocaleString('zh-CN',{hour12:false}) : '';
+  }
+  renderAccounts();
+  ['card-access','card-models','card-usage','card-out'].forEach(id =>
+    $('#' + id).classList.toggle('dim', !on));
+  $('#card-account-tools').classList.toggle('dim', !on);
+  renderAccountTools();
+}
+
+let pointsGeneration = 0, pointsBusy = false, checkinBusy = false;
+let autoCheckinSaving = false, startupSaving = false;
+function renderAccountTools(){
+  const cached = (STATE && STATE.points) || {};
+  const p = cached.accountId && cached.accountId !== STATE.activeAccountId ? {} : cached;
+  const on = !!(STATE && STATE.loggedIn), account = (STATE && STATE.account) || {};
+  const canCheckin = on && STATE.realm === 'cn' && !account.enterpriseId;
+  const updated = p.updatedAt ? '更新于 ' + new Date(p.updatedAt*1000).toLocaleString('zh-CN',{hour12:false}) : '';
+  $('#points-balance').textContent = !on ? '—' : p.unlimited ? '不限量' :
+    p.balance == null ? '—' : Number(p.balance).toLocaleString('zh-CN',{maximumFractionDigits:4});
+  $('#points-owner').textContent = on ? (account.displayName || account.nickname || '当前账户') + ' · ' +
+    (STATE.realm === 'global' ? '国际版' : '国内版') : '登录后自动获取余额';
+  $('#points-detail').textContent = !on ? '等待连接账户' : pointsBusy ? '正在获取当前账户积分…' :
+    p.error ? '查询失败：' + p.error + (updated ? ' · 上次' + updated : '') : updated || (p.balance == null && !p.unlimited ? '尚未获取积分，可点击右上角刷新' : '已同步当前账户余额');
+  $('#points-detail').classList.toggle('error-text', !!p.error && !pointsBusy);
+  $('#points-refresh').setAttribute('aria-busy',String(pointsBusy));
+  $('#points-refresh .icon').classList.toggle('refreshing', pointsBusy);
+  $('#points-refresh').disabled = !on || pointsBusy || checkinBusy || accountSwitching;
+  const today = new Date(Date.now()+8*3600000).toISOString().slice(0,10);
+  $('#checkin-status').textContent = !on ? '登录后查看签到状态' : !canCheckin ? '此账户不支持每日签到' :
+    p.checkinDay && p.checkinDay !== today ? '今日待签到' : p.checkinMessage || '可查询并领取今日积分';
+  $('#checkin-submit').disabled = !canCheckin || checkinBusy || accountSwitching;
+  $('#checkin-submit').textContent = checkinBusy ? '正在签到…' : '签到领积分';
+  $('#auto-checkin').checked = !!(STATE && STATE.autoCheckin);
+  $('#auto-checkin').disabled = autoCheckinSaving;
+  const s = (STATE && STATE.startup) || {};
+  $('#startup-enabled').checked = !!s.enabled;
+  $('#startup-enabled').disabled = s.supported === false || startupSaving;
+  $('#startup-status').textContent = s.message || '正在读取 wb2api 自启设置…';
+}
+function acceptPoints(p, aid){
+  if(!STATE || STATE.activeAccountId !== aid) return false;
+  if(p.accountId && p.accountId !== aid) return false;
+  STATE.points = {...(STATE.points || {}), ...p};
+  return true;
+}
+async function loadPoints(){
+  if(!STATE || !STATE.loggedIn || checkinBusy) return;
+  const aid = STATE.activeAccountId, generation = ++pointsGeneration;
+  pointsBusy = true; renderAccountTools();
+  try{
+    const p = await api('/admin/points');
+    if(generation === pointsGeneration) acceptPoints(p, aid);
+  }catch(e){
+    if(generation === pointsGeneration && STATE.activeAccountId === aid)
+      STATE.points = {...(STATE.points || {}), error:e.message};
+  }finally{
+    if(generation === pointsGeneration){ pointsBusy = false; renderAccountTools(); }
+  }
+}
+async function checkin(){
+  if(!STATE || !STATE.loggedIn || checkinBusy) return;
+  const aid = STATE.activeAccountId, generation = ++pointsGeneration;
+  checkinBusy = true; renderAccountTools();
+  try{
+    const p = await api('/admin/points/checkin',{method:'POST',body:'{}'});
+    // 签到成功后的余额必须压过签到开始前已发出的旧查询。
+    // 再推进一代，令签到期间启动的普通刷新也失效。
+    if(generation === pointsGeneration && acceptPoints(p, aid)){
+      pointsGeneration++;
+    }
+  }catch(e){
+    if(generation === pointsGeneration && STATE.activeAccountId === aid)
+      STATE.points = {...(STATE.points || {}), checkinMessage:'签到失败：' + e.message};
+  }finally{
+    // 签到期间不会启动新的普通积分请求；无论旧请求何时结束，
+    // 签到收尾都要释放积分查询忙碌状态。
+    pointsBusy = false;
+    if(STATE.activeAccountId === aid) renderAccountTools();
+    checkinBusy = false; renderAccountTools();
+  }
+}
+async function setAutoCheckin(){
+  if(autoCheckinSaving) return;
+  const enabled = $('#auto-checkin').checked;
+  autoCheckinSaving = true; $('#auto-checkin').disabled = true;
+  $('#auto-checkin-status').textContent = '';
+  try{
+    const d = await api('/admin/settings',{method:'POST',body:JSON.stringify({autoCheckin:enabled})});
+    if(d.ok === false) throw new Error(d.message || '保存失败');
+    STATE.autoCheckin = d.autoCheckin;
+    $('#auto-checkin-status').textContent = '';
+  }catch(e){
+    $('#auto-checkin-status').textContent = '自动签到设置失败：' + e.message;
+  }finally{
+    autoCheckinSaving = false; renderAccountTools();
+  }
+}
+async function setStartup(){
+  if(startupSaving) return;
+  const enabled = $('#startup-enabled').checked;
+  startupSaving = true; $('#startup-enabled').disabled = true;
+  $('#startup-status').textContent = '正在保存 wb2api 自启设置…';
+  let error = '';
+  try{
+    const d = await api('/admin/startup',{method:'POST',body:JSON.stringify({enabled})});
+    if(d.ok === false) throw new Error(d.message || '保存失败');
+    STATE.startup = d;
+  }catch(e){
+    error = 'wb2api 自启设置失败：' + e.message;
+  }finally{
+    startupSaving = false; renderAccountTools();
+    if(error) $('#startup-status').textContent = error;
+  }
+}
+
+function renderAccounts(){
+  const accounts = (STATE && STATE.accounts) || [];
+  $('#account-switcher').classList.toggle('hidden', !accounts.length);
+  const select = $('#account-select');
+  select.innerHTML = accounts.map(a => {
+    const expired = a.expiresAt && a.expiresAt * 1000 <= Date.now();
+    const label = (a.displayName || a.nickname || '未命名账号') + ' · ' +
+      (a.realm === 'cn' ? '国内版' : '国际版') +
+      (a.enterpriseId ? ' · 企业' : '') +
+      (a.id === STATE.activeAccountId ? '（当前）' : '') + (expired ? ' · 需刷新授权' : '');
+    return '<option value="' + escapeHtml(a.id) + '"' +
+      (a.id === STATE.activeAccountId ? ' selected' : '') + '>' + escapeHtml(label) + '</option>';
+  }).join('');
+  select.disabled = accountSwitching || loginBusy;
+}
+
+async function switchAccount(){
+  const accountId = $('#account-select').value;
+  if(accountSwitching || loginBusy || !accountId || accountId === STATE.activeAccountId) return;
+  accountSwitching = true;
+  loginGeneration++;
+  loginChoosing = false;
+  modelsGeneration++;
+  stateGeneration++;
+  saveRevision++;
+  renderLogin();
+  $('#account-status').textContent = '正在切换账号…';
+  try{
+    await flushSelections();
+    const d = await api('/admin/accounts/switch', {method:'POST', body:JSON.stringify({accountId})});
+    CATALOG = {models:[], promotions:[]};
+    await refreshState(d.state, false);
+    $('#account-status').textContent = '已切换到 ' + (STATE.account.displayName || STATE.account.nickname || '所选账号');
+  }catch(e){
+    $('#account-status').textContent = '切换失败：' + e.message;
+    void loadModels(false);
+  }finally{
+    accountSwitching = false;
+    renderLogin();
+  }
+}
+
+/* ---------- 接入信息 ---------- */
+function baseUrl(){ return location.origin + '/v1'; }
+function renderAccess(){
+  $('#out-base').value = baseUrl();
+  $('#out-key').value = STATE.apiKey || '';
+}
+
+/* ---------- 模型 ---------- */
+let indexedCatalog = null, catalogIndex = null;
+const modelRows = new Map();
+function modelIndex(){
+  if(indexedCatalog === CATALOG) return catalogIndex;
+  const promotions = new Map(), factors = new Map(), credits = new Map(), models = [], ids = new Set();
+  for(const promo of CATALOG.promotions || []){
+    for(const id of promo.modelIds || []) if(!promotions.has(id)) promotions.set(id, promo);
+  }
+  for(const model of CATALOG.models || []){
+    const promo = promotions.get(model.id);
+    const discounted = promo ? parseFactor(promo.discountedCredits) : null;
+    const base = parseFactor(model.credits);
+    const factor = discounted !== null ? discounted : base;
+    credits.set(model.id, {base, discounted});
+    factors.set(model.id, factor);
+    if(factor !== null){ models.push(model); ids.add(model.id); }
+  }
+  indexedCatalog = CATALOG;
+  return catalogIndex = {promotions, factors, credits, models, ids};
+}
+function promoFor(id){ return modelIndex().promotions.get(id) || null; }
+
+let modelsGeneration = 0;
+async function loadModels(force){
+  const generation = ++modelsGeneration, revision = saveRevision;
+  $('#models-status').innerHTML = '<span class="spin"></span> 正在拉取模型目录…';
+  try{
+    const d = await api(force ? '/admin/models/refresh' : '/admin/models',
+                        force ? {method:'POST', body:'{}'} : undefined);
+    if(generation !== modelsGeneration) return;
+    if(d.accountId && STATE.activeAccountId && d.accountId !== STATE.activeAccountId){
+      await refreshState();
+      return;
+    }
+    CATALOG = {models: d.models || [], promotions: d.promotions || []};
+    if(revision === saveRevision){
+      const ids = modelIndex().ids;
+      SELECTED = new Set((pendingSelections.get(STATE.activeAccountId) || d.selected || []).filter(id => ids.has(id)));
+    }
+    renderModels();
+  }catch(e){
+    if(generation === modelsGeneration) $('#models-status').textContent = '拉取失败：' + e.message;
+  }
+}
+
+function knownModels(){ return modelIndex().models; }
+function visibleModels(){
+  const q = ($('#q').value || '').trim().toLowerCase();
+  const list = knownModels().filter(m => !q || (m.id + ' ' + (m.name || '')).toLowerCase().includes(q));
+  const order = $('#model-sort').value;
+  if(order === 'credits-asc' || order === 'credits-desc'){
+    list.sort((a,b) => {
+      const left = effectiveFactor(a), right = effectiveFactor(b);
+      return order === 'credits-asc' ? left - right : right - left;
+    });
+  }
+  return list;
+}
+
+function renderModels(){
+  const list = visibleModels();
+  const tb = $('#tbody');
+  modelRows.clear();
+  if(!list.length){
+    tb.innerHTML = '<tr><td colspan="5" class="empty">' +
+      (knownModels().length ? '没有匹配的模型' : '暂无倍率明确的模型，请先登录或同步目录') + '</td></tr>';
+  } else {
+    tb.innerHTML = list.map(m => {
+      const p = promoFor(m.id);
+      const cached = modelIndex().credits.get(m.id);
+      let credit = cached.base !== null ? escapeHtml(m.credits) : '未知';
+      if(p && cached.discounted !== null){
+        credit = '<span title="' + escapeHtml(p.note || '限时优惠') + '">' +
+                 '<s>' + escapeHtml(m.credits ?? '') + '</s> ' +
+                 escapeHtml(p.discountedCredits) + '</span>';
+      }
+      if(effectiveFactor(m) === 0) credit = '<span class="free-factor">' + credit + '</span>';
+      const tags = (m.tags || []).map(t => '<span class="tag">' + escapeHtml(t) + '</span>').join('');
+      const def = m.is_default ? ' <span class="tag">默认</span>' : '';
+      const img = m.supports_images ? ' <span class="tag">图片</span>' : '';
+      return '<tr class="' + (SELECTED.has(m.id) ? 'sel' : '') + '">' +
+        '<td class="c"><input type="checkbox" ' + (SELECTED.has(m.id) ? 'checked' : '') +
+          ' aria-label="选择 ' + escapeHtml(m.id) + '" data-id="' + escapeHtml(m.id) + '"></td>' +
+        '<td class="id"><div class="model-identity"><span class="model-glyph" aria-hidden="true">' + escapeHtml(Array.from(m.name || m.id)[0].toUpperCase()) + '</span><div>' +
+          '<div class="model-name">' + escapeHtml(m.id) + def + img + '</div>' +
+          (m.name && m.name !== m.id ? '<div class="model-subtitle">' + escapeHtml(m.name) + '</div>' : '') +
+          (tags ? '<div>' + tags + '</div>' : '') + '</div></div></td>' +
+        '<td class="credits">' + credit + '</td>' +
+        '<td class="num">' + fmtNum(m.context_length) + '</td>' +
+        '<td class="num">' + fmtNum(m.max_output_tokens) + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  tb.querySelectorAll('input[data-id]').forEach(input => modelRows.set(input.dataset.id, input));
+  renderSelectionSummary();
+}
+
+function updateSelectionView(id){
+  const update = input => {
+    if(!input) return;
+    const on = SELECTED.has(input.dataset.id);
+    input.checked = on;
+    input.closest('tr').classList.toggle('sel', on);
+  };
+  if(id !== undefined) update(modelRows.get(id));
+  else modelRows.forEach(update);
+  renderSelectionSummary();
+}
+
+function renderSelectionSummary(){
+  const {models:available, ids:availableIds} = modelIndex();
+  const n = (CATALOG.models || []).length ? [...SELECTED].filter(id => availableIds.has(id)).length : SELECTED.size;
+  const total = available.length;
+  $('#sel-count').textContent = n ? (total ? '已选 ' + n + ' / ' + total : '已选 ' + n + '（等待目录）') : (STATE && STATE.enforce ? '未选择（禁止全部）' : '未选择（返回全部）');
+  $('#sel-count').className = 'pill' + (n ? ' ok' : '');
+  $('#models-status').textContent = total ? '共 ' + total + ' 个模型' : '';
+  renderOut();
+}
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+document.addEventListener('change', e => {
+  const el = e.target;
+  if(el && el.matches && el.matches('#tbody input[type=checkbox][data-id]')) toggle(el.dataset.id, el.checked);
+});
+
+let saveQueue = Promise.resolve(), saveRevision = 0, saveWorker = null, releaseSaveDelay = null;
+const pendingSelections = new Map(), queuedSelections = new Map();
+function toggle(id, on){
+  if(accountSwitching || loginBusy || !STATE?.loggedIn) return;
+  if(on) SELECTED.add(id); else SELECTED.delete(id);
+  updateSelectionView(id);
+  saveSelection();
+}
+async function drainSelections(){
+  try{
+    // 短时间内的连续操作只提交最新快照；切换或登录会立即结束等待。
+    await new Promise(resolve => {
+      const timer = setTimeout(() => { releaseSaveDelay = null; resolve(); }, 200);
+      releaseSaveDelay = () => { clearTimeout(timer); releaseSaveDelay = null; resolve(); };
+    });
+    while(queuedSelections.size){
+      const [aid, job] = queuedSelections.entries().next().value;
+      queuedSelections.delete(aid);
+      try{
+        const d = await api('/admin/selection', {method:'POST',
+          body:JSON.stringify({models:job.models, accountId:aid})});
+        if(d.accountId !== aid) throw new Error('账号已变化，请重新选择账户后再保存');
+        if(!queuedSelections.has(aid)) pendingSelections.delete(aid);
+        if(STATE.activeAccountId === aid && job.revision === saveRevision){
+          STATE.selected = d.selected;
+          $('#save-status').textContent = '已保存到当前账户';
+          $('#save-retry').classList.add('hidden');
+        }
+      }catch(e){
+        // pendingSelections 始终保留最新修改，旧请求失败不会覆盖后续勾选。
+        if(STATE.activeAccountId === aid && job.revision === saveRevision){
+          $('#save-status').textContent = '保存失败，当前修改尚未生效：' + e.message;
+          $('#save-retry').classList.remove('hidden');
+        }
+      }
+    }
+  }finally{ saveWorker = null; }
+}
+function persistConfig(patch){
+  if(accountSwitching || loginBusy || !STATE?.loggedIn) return saveQueue;
+  const aid = STATE.activeAccountId, models = [...patch.models], revision = ++saveRevision;
+  pendingSelections.set(aid, models);
+  queuedSelections.set(aid, {models, revision});
+  $('#save-status').textContent = '正在保存…';
+  $('#save-retry').classList.add('hidden');
+  if(!saveWorker) saveQueue = saveWorker = drainSelections();
+  return saveQueue;
+}
+async function flushSelections(){
+  if(releaseSaveDelay) releaseSaveDelay();
+  await saveQueue;
+}
+function saveSelection(){ return persistConfig({models:[...SELECTED]}); }
+function retrySave(){
+  const models = pendingSelections.get(STATE?.activeAccountId) || [...SELECTED];
+  SELECTED = new Set(models);
+  updateSelectionView();
+  return persistConfig({models});
+}
+function parseFactor(value){
+  if(value === null || value === undefined || typeof value === 'boolean') return null;
+  const text = String(value).trim().replace(/^[xX×]\s*/, '');
+  if(!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(text)) return null;
+  const factor = Number(text);
+  return Number.isFinite(factor) && factor >= 0 ? factor : null;
+}
+function effectiveFactor(model){
+  return modelIndex().factors.get(model.id) ?? null;
+}
+function bulk(mode){
+  if(accountSwitching || loginBusy || !STATE?.loggedIn) return;
+  const list = visibleModels();
+  if(mode === 'all') list.forEach(m => SELECTED.add(m.id));
+  else if(mode === 'none') SELECTED.clear();
+  else if(mode === 'invert') list.forEach(m => SELECTED.has(m.id) ? SELECTED.delete(m.id) : SELECTED.add(m.id));
+  else if(mode === 'cheap'){
+    const cheap = list.filter(m => { const f = effectiveFactor(m); return f !== null && f <= 1; });
+    if(!cheap.length){
+      $('#models-status').textContent = '没有找到有效倍率为 0～1 的模型，已保留原选择';
+      return;
+    }
+    SELECTED = new Set(cheap.map(m => m.id));
+  }
+  updateSelectionView();
+  saveSelection();
+}
+
+/* ---------- 输出 ---------- */
+function chosen(){
+  const list = knownModels();
+  return SELECTED.size || (STATE && STATE.enforce) ? list.filter(m => SELECTED.has(m.id)) : list;
+}
+
+function tab(name){
+  TAB = name;
+  document.querySelectorAll('.tabs button[data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
+  renderOut();
+}
+
+function renderOut(){
+  const list = chosen();
+  const names = list.map(m => m.id);
+  const key = STATE ? STATE.apiKey : '';
+  const def = STATE && names.includes(STATE.defaultModel) ? STATE.defaultModel : names[0] || '';
+  const toml = value => JSON.stringify(String(value));
+  let text = '', hint = '';
+  if(TAB === 'names'){
+    text = names.join('\n');
+    hint = names.length + ' 个模型名';
+  } else if(TAB === 'codex'){
+    text = '# ~/.codex/config.toml\n' +
+           'model = ' + toml(def) + '\n' +
+           'model_provider = "wb2api"\n\n' +
+           '[model_providers.wb2api]\n' +
+           'name = "wb2api"\n' +
+           'base_url = "' + baseUrl() + '"\n' +
+           'env_key = "WB2API_API_KEY"\n' +
+           'wire_api = "responses"\n\n' +
+           '# 再在 shell 里：export WB2API_API_KEY=' + key;
+    hint = 'Codex 走 Responses 接口（真流式）';
+  } else if(TAB === 'anthropic'){
+    text = JSON.stringify({env: {
+      ANTHROPIC_BASE_URL: location.origin,
+      ANTHROPIC_API_KEY: key,
+      ANTHROPIC_MODEL: def
+    }}, null, 2);
+    hint = '可合并到 ~/.claude/settings.json；模型使用当前选择的实际模型 ID';
+  } else if(TAB === 'json'){
+    text = JSON.stringify({baseUrl: baseUrl(), apiKey: key, models: names}, null, 2);
+    hint = '可直接粘进配置文件';
+  } else {
+    text = '# OpenAI SDK\n' +
+           'export OPENAI_BASE_URL=' + baseUrl() + '\n' +
+           'export OPENAI_API_KEY=' + key + '\n' +
+           'export OPENAI_MODELS="' + names.join(',') + '"\n\n' +
+           '# Anthropic SDK\n' +
+           'export ANTHROPIC_BASE_URL=' + location.origin + '\n' +
+           'export ANTHROPIC_API_KEY=' + key;
+    hint = 'OpenAI 与 Anthropic 环境变量';
+  }
+  $('#out-text').value = text;
+  $('#out-hint').textContent = hint;
+}
+
+
+/* ---------- 用量 ---------- */
+function utab(name){
+  UTAB = name;
+  document.querySelectorAll('.tabs button[data-utab]').forEach(b => b.classList.toggle('on', b.dataset.utab === name));
+  renderUsage();
+}
+async function loadUsage(){
+  $('#usage-status').textContent = '正在刷新用量…';
+  try { USAGE = await api('/admin/usage'); renderUsage(); $('#usage-status').textContent = ''; }
+  catch(e){ $('#usage-status').textContent = '刷新失败：' + e.message; }
+}
+function renderUsage(){
+  const today = Object.values((USAGE && USAGE.today) || {});
+  $('#today-requests').textContent = today.reduce((n,m) => n + (m.requests || 0), 0).toLocaleString('zh-CN');
+  $('#today-credits').textContent = today.reduce((n,m) => n + (m.credits || 0), 0).toLocaleString('zh-CN',{maximumFractionDigits:2});
+  const data = (USAGE && USAGE[UTAB]) || {};
+  const rows = Object.entries(data).sort((a, b) => b[1].requests - a[1].requests);
+  let req = 0, w = 0, cr = 0;
+  rows.forEach(r => { req += r[1].requests; w += r[1].weighted_k || 0; cr += r[1].credits || 0; });
+  $('#usage-sum').textContent = req ? (req + ' 次请求 · 积分 ' + cr.toFixed(2) + ' · 加权 ' + w.toFixed(2)) : '暂无';
+  $('#usage-body').innerHTML = rows.length ? rows.map(([id, m]) =>
+    '<tr><td class="id">' + escapeHtml(id || '(未知)') + '</td><td class="num">' + m.requests +
+    '</td><td class="num">' + (m.errors || 0) + '</td><td class="num">' + fmtNum(m.input_tokens) +
+    '</td><td class="num">' + fmtNum(m.output_tokens) + '</td><td class="num">' +
+    (m.credits ? m.credits.toFixed(2) : '0') + '</td><td class="num">' +
+    (m.weighted_k != null ? m.weighted_k.toFixed(2) : '—') + '</td></tr>').join('')
+    : '<tr><td colspan="7" class="empty">还没有请求记录</td></tr>';
+}
+
+/* ---------- 启动 ---------- */
+let stateGeneration = 0;
+async function refreshState(nextState, waitForAccount = true){
+  const generation = ++stateGeneration;
+  const state = nextState || await api('/admin/state');
+  if(generation !== stateGeneration) return;
+  const changed = STATE && STATE.activeAccountId !== state.activeAccountId;
+  if(changed){
+    saveRevision++;
+    $('#account-status').textContent = '';
+    modelsGeneration++;
+    pointsGeneration++;
+    pointsBusy = false;
+    CATALOG = {models:[], promotions:[]};
+  }
+  STATE = state;
+  if(STATE.points && STATE.points.accountId && STATE.points.accountId !== STATE.activeAccountId) STATE.points = {};
+  SELECTED = new Set(pendingSelections.get(STATE.activeAccountId) || STATE.selected || []);
+  const pending = pendingSelections.has(STATE.activeAccountId);
+  $('#save-status').textContent = pending ? '此账户有尚未保存的勾选，请重试保存' : '';
+  $('#save-retry').classList.toggle('hidden', !pending);
+  USAGE = STATE.usage || null;
+  renderLogin();
+  renderAccess();
+  renderUsage();
+  renderModels();
+  $('#connection-text').textContent = '本地服务已连接';
+  $('#service-status').innerHTML = '<span class="dot"></span>服务运行中';
+  if(STATE.loggedIn){
+    const pending = Promise.all([loadModels(false), loadPoints()]);
+    if(waitForAccount) await pending;
+  }
+  else renderOut();
+}
+
+showView(location.hash.slice(1), false);
+$('#current-date').textContent = new Date().toLocaleDateString('zh-CN',{year:'numeric',month:'long',day:'numeric',weekday:'long'});
+refreshState().catch(e => {
+  $('#connection-text').textContent = '连接失败';
+  $('#connection-dot').style.color = 'var(--error)';
+  $('#service-status').textContent = '服务连接失败';
+  $('#service-status').classList.add('error-text');
+  $('#page-description').textContent = '无法连接后端：' + e.message + '。请确认 wb2api.py 正在运行后刷新页面。';
+  $('#page-description').classList.add('error-text');
+});
+</script>
+</body>
+</html>
