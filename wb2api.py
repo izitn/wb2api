@@ -1167,12 +1167,14 @@ def _pool_pick(realm: str, session_key: str = "", exclude: set | None = None) ->
     if session_key:
         with _pool_lock:
             hit = _pool_sticky.get(session_key)
-            if hit and hit[1] > now:
-                aid = hit[0]
-                if aid in by_id and aid not in exclude and _pool_available(aid, now):
-                    return by_id[aid]
-            elif hit:
+            if hit and hit[1] <= now:
                 _pool_sticky.pop(session_key, None)   # 过期即清
+                hit = None
+        # 注意：_pool_available 自己也会取 _pool_lock，不要在上面的 with 里调用它
+        if hit and hit[1] > now:
+            aid = hit[0]
+            if aid in by_id and aid not in exclude and _pool_available(aid, now):
+                return by_id[aid]
     # 2) 当前账号优先：只有一个账号的人不会感到任何变化
     cur = _auth
     if cur is not None and realm_of(cur) == realm:
