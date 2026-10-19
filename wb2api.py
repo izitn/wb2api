@@ -33,6 +33,7 @@ import http.client
 import json
 import math
 import os
+import secrets
 import ssl
 import subprocess
 import sys
@@ -58,6 +59,12 @@ MODELS_PATH = "/v3/config"
 # 客户端版本：上游提高最低版本要求时，用环境变量覆盖即可，不必改源码
 CLIENT_VERSION = os.environ.get("WB_CLIENT_VERSION", "5.5.4")      # UA 里的 WorkBuddy/<ver>
 CLI_VERSION = os.environ.get("WB_CLI_VERSION", "2.137.1")          # UA 里的 CLI/<ver>
+# 国际版桌面端身份：按对 WorkBuddy 5.8.4 的抓包对齐（2026-10-16 样本）。
+# 2026-10-19 起上游加强国际版渠道校验（400 / code 11128 "request illegal"，
+# displayTips 明说"没通过渠道校验，可能不是官方客户端发出的"），旧的 5.5.x 身份
+# 与缺失的会话头族会被判非官方。国内版没有对应抓包且目前正常，维持原身份不动。
+INTL_CLIENT_VERSION = os.environ.get("WB_INTL_CLIENT_VERSION", "5.8.4")
+INTL_CLI_VERSION = os.environ.get("WB_INTL_CLI_VERSION", "2.161.0")
 IDE_UA = os.environ.get("WB_IDE_UA", "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0")  # 目录探测路之一
 CLI_UA = os.environ.get("WB_CLI_UA", "CLI/2.63.2 CodeBuddy/2.63.2")           # 目录探测路之一
 # realm → (上游 base, Origin, X-Domain, UA 平台段, Accept-Language, 显示名)
@@ -1133,13 +1140,37 @@ _chat_static: dict = {"key": None, "h": None}
 _chat_static_lock = threading.Lock()
 
 
-def chat_headers(a: dict) -> dict:
-    """common 之上叠加 chat 专属头：用量归因 + 会话链路头族。
+def _uuid7() -> uuid.UUID:
+    """RFC 9562 UUIDv7（时间有序）。
 
-    静态部分按 (token, uid, 企业, 域, realm) 缓存，每个请求只拷贝字典并补 8 个链路 ID。
+    5.8.4 客户端的会话 id 是带连字符的 UUID、请求/消息 id 是 32 位 hex，
+    都取这个形态。上游并不校验版本位（抓包里 v4 与 v7 都被接受），
+    这里只求形态贴近。
+    """
+    ms = int(time.time() * 1000) & ((1 << 48) - 1)
+    rand_a = secrets.randbits(12)
+    rand_b = secrets.randbits(62)
+    return uuid.UUID(int=(ms << 80) | (0x7 << 76) | (rand_a << 64)
+                     | (0b10 << 62) | rand_b)
+
+
+def chat_headers(a: dict) -> dict:
+    """common 之上叠加 chat 专属头，并按官方客户端的 wire 形状补齐会话/链路头族。
+
+    上游的渠道校验（400 / code 11128）看的就是这些：官方对话请求固定携带
+      * X-Conversation-ID              带连字符的 UUID，每次请求现生成
+      * X-Conversation-Request-ID == X-Root-Request-ID   32 位 hex
+      * X-Conversation-Message-ID == X-Request-ID         32 位 hex
+      * X-Agent-Intent / X-Agent-Type / X-Private-Data
+      * trace 家族（traceparent / b3 / X-B3-* / X-Trace-ID）
+    另外官方对话请求**不**带 X-Machine-ID / X-Session-ID（那两个只用于反馈上报），
+    恒定的派生值反而是一处"网关特征"，这里发 chat 前剔除。
+
+    静态部分按 (token, uid, 企业, 域, realm) 缓存，每个请求只补现生成的 ID。
     """
     key = (a.get("accessToken"), a.get("uid"), a.get("enterpriseId"), a.get("domain"),
            a.get("realm"), a.get("deviceToken"), UPSTREAM_OVERRIDE)
+    intl = is_global(a)
     with _chat_static_lock:
         if _chat_static["key"] != key:
             h = common_headers(a)
@@ -1147,18 +1178,33 @@ def chat_headers(a: dict) -> dict:
             h["X-Agent-Purpose"] = "conversation"
             h["X-IDE-Name"] = "WorkBuddy"
             h["X-IDE-Type"] = "WorkBuddy"
-            h["X-IDE-Version"] = CLIENT_VERSION
-            h["X-Product"] = "WorkBuddy"
+            h.pop("X-Machine-ID", None)
+            h.pop("X-Session-ID", None)
+            if intl:
+                h["X-IDE-Version"] = INTL_CLIENT_VERSION
+                h["X-Product"] = "SaaS"
+                h["X-Agent-Intent"] = "craft"
+                h["X-Agent-Type"] = "main"
+                h["X-Private-Data"] = "true"
+                h["User-Agent"] = desktop_ua(a)
+            else:
+                h["X-IDE-Version"] = CLIENT_VERSION
+                h["X-Product"] = "WorkBuddy"
             _chat_static.update(key=key, h=h)
         h = dict(_chat_static["h"])
-    mid, crid = uuid.uuid4().hex, uuid.uuid4().hex
-    h["X-Conversation-Request-ID"] = crid
-    h["X-Conversation-Message-ID"] = mid
-    h["X-Request-ID"] = mid
-    h["X-Root-Request-ID"] = crid
-    h["X-Trace-ID"] = crid
-    h["X-B3-TraceId"] = crid
-    h["X-B3-SpanId"] = mid[:16]
+    # 会话头族每请求现生成：上游不拿这个 id 存历史，补的是"有"而不是"稳定"
+    msg_id, conv_req_id = _uuid7().hex, _uuid7().hex
+    trace_id, span_id = _uuid7().hex, secrets.token_hex(8)
+    h["X-Conversation-ID"] = str(_uuid7())
+    h["X-Conversation-Request-ID"] = conv_req_id
+    h["X-Root-Request-ID"] = conv_req_id
+    h["X-Conversation-Message-ID"] = msg_id
+    h["X-Request-ID"] = msg_id
+    h["X-Trace-ID"] = trace_id
+    h["traceparent"] = "00-%s-%s-01" % (trace_id, span_id)
+    h["b3"] = "%s-%s-1" % (trace_id, span_id)
+    h["X-B3-TraceId"] = trace_id
+    h["X-B3-SpanId"] = span_id
     h["X-B3-Sampled"] = "1"
     return h
 
@@ -1226,11 +1272,16 @@ def validate_request(path: str, body: dict) -> None:
             raise ValueError("instructions 必须是字符串")
 
 
-def normalize_chat_body(obj: dict) -> dict:
+def normalize_chat_body(obj: dict, account: dict | None = None) -> dict:
     # 1) 上游只吃流式，非流式由本代理在本地聚合
     obj["stream"] = True
-    so = obj.get("stream_options") if isinstance(obj.get("stream_options"), dict) else {}
-    obj["stream_options"] = dict(so, include_usage=True)  # 末帧才有 usage；用量统计也依赖它
+    # 国际版不认 stream_options（会 400 code=11128）；国内版依赖它拿末帧 usage。
+    # account 为空视为未知（沿用国内版口径），仅在明确是国际版账号时剔除。
+    if isinstance(account, dict) and is_global(account):
+        obj.pop("stream_options", None)
+    else:
+        so = obj.get("stream_options") if isinstance(obj.get("stream_options"), dict) else {}
+        obj["stream_options"] = dict(so, include_usage=True)  # 末帧才有 usage；用量统计也依赖它
 
     # 2) max_completion_tokens 是 OpenAI 新别名，上游只认 max_tokens
     alias = obj.pop("max_completion_tokens", None)
@@ -1264,7 +1315,8 @@ def normalize_chat_body(obj: dict) -> dict:
     # 上游要求首条必须是 system（否则 400 code=11128）；客户端没给就补一条最小的
     if isinstance(msgs, list):
         first = msgs[0] if msgs and isinstance(msgs[0], dict) else {}
-        if str(first.get("role") or "").lower() not in ("system", "developer"):
+        first_role = str(first.get("role") or "").lower()
+        if first_role not in ("system", "developer"):
             msgs.insert(0, {"role": "system", "content": DEFAULT_SYSTEM})
     if isinstance(msgs, list):
         for m in msgs:
@@ -1906,8 +1958,10 @@ def call_upstream(payload: dict, a: dict) -> UpstreamResponse:
             # 只记录元数据：payload 里的 messages/system 是用户对话正文，绝不能进日志。
             # _safe_log_payload 负责剔除这些字段，这里只补充体积、条数等排查信息。
             meta = _safe_log_payload(payload)
-            log("→ POST %s model=%s messages=%d fields=%d %dB%s" % (
-                url, meta.get("model"), len(payload.get("messages") or []), len(meta),
+            msgs = payload.get("messages") or []
+            first_msg = msgs[0] if msgs and isinstance(msgs, list) and msgs[0] and isinstance(msgs[0], dict) else {}
+            log("→ POST %s model=%s messages=%d (首条role=%s) fields=%d %dB%s" % (
+                url, meta.get("model"), len(msgs), first_msg.get("role", "N/A"), len(meta),
                 len(body), "（gzip，原 %dB）" % len(data) if body is gz else ""))
         try:
             resp = upstream_request("POST", url, h, body)
@@ -2906,11 +2960,16 @@ def is_global(a: dict | None = None) -> bool:
 
 
 def desktop_ua(a: dict | None = None) -> str:
-    """官方桌面端 UA。平台段按 realm 切——国际版必须是 `WorkBuddy AI`，
-    发成 `WorkBuddy` 可能触发上游 403 code 11140。"""
-    platform = "WorkBuddy AI" if is_global(a) else "WorkBuddy"
-    return "WorkBuddy/%s %s/%s CLI/%s" % (
-        CLIENT_VERSION, platform, CLIENT_VERSION, CLI_VERSION)
+    """官方桌面端 UA。
+
+    国际版按 5.8.4 抓包：`WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`
+    （末段 CLI 版本是客户端内置 CLI 的版本，不是桌面端自身版本）；
+    国内版维持既有身份——没有对应抓包，改动风险大于收益。
+    """
+    if is_global(a):
+        return "WorkBuddy/%s workbuddy-ai/%s CLI/%s" % (
+            INTL_CLIENT_VERSION, INTL_CLIENT_VERSION, INTL_CLI_VERSION)
+    return "WorkBuddy/%s WorkBuddy/%s CLI/%s" % (CLIENT_VERSION, CLIENT_VERSION, CLI_VERSION)
 
 
 def models_headers(a: dict, ua: str) -> dict:
@@ -4319,7 +4378,7 @@ class Handler(BaseHTTPRequestHandler):
         elif isinstance(body.get("n"), int) and body["n"] > 1:
             return self._error(400, "上游不支持一次生成多个候选结果（n > 1）", "invalid_request_error")
 
-        payload = normalize_chat_body(body)
+        payload = normalize_chat_body(body, a)
         t0 = time.time()
         acc = ChatAccumulator()
         status, ttft = 200, None

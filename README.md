@@ -104,6 +104,21 @@ Anthropic SDK 接入时，将 `ANTHROPIC_BASE_URL` 设置为 `http://127.0.0.1:8
 
 Responses 的 `previous_response_id` 历史保存在内存中，最多 256 条、保留 6 小时，序列化历史总容量最多 32 MiB（不是进程总内存上限）。超过条数或容量时淘汰最早存入的历史，单条超过容量上限则不缓存。访问缓存及后台每 30 秒的维护会清理过期记录。重启、过期或淘汰后，相应 ID 无法续接，需要重新提供上下文。
 
+## 国际版出站身份（渠道校验）
+
+上游会校验请求是否"像官方客户端发出的"，不通过时返回 `400 / code 11128`（`request illegal`，`displayTips` 提示"这次调用没通过渠道校验，可能不是官方客户端发出的"）。2026-10-19 起该校验对国际版明显收紧，只补 `system` 首条消息已不足以通过。
+
+代理按对 WorkBuddy 5.8.4 的抓包对齐了国际版出站身份，主要包括：
+
+- 版本与 UA：`X-IDE-Version: 5.8.4`，UA `WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`（可用 `WB_INTL_CLIENT_VERSION` / `WB_INTL_CLI_VERSION` 覆盖）。
+- 身份头：`X-Product: SaaS`、`X-Agent-Type: main`、`X-Agent-Intent: craft`、`X-Private-Data: true`。
+- 会话头族：`X-Conversation-ID`（带连字符 UUID，每请求现生成）、`X-Conversation-Request-ID` 与 `X-Root-Request-ID` 同值、`X-Conversation-Message-ID` 与 `X-Request-ID` 同值，后四者为 32 位 hex。
+- 链路头族：`X-Trace-ID`、`traceparent`、`b3`、`X-B3-TraceId`、`X-B3-SpanId`、`X-B3-Sampled`。
+- 对话请求不再发送 `X-Machine-ID` / `X-Session-ID`：官方只在反馈上报里发，恒定的派生值反而是网关特征。
+- 国际版不发送 `stream_options`（上游不认，国内版仍依赖它取 usage）。
+
+国内版没有对应抓包且当前正常，出站身份维持原样。若上游再次调整，优先核对官方客户端版本与抓包字段，再改这里。
+
 ## 离线回归测试
 
 测试使用模拟账户和上游事件流，不访问真实账户、上游服务或 Windows 自启设置。
@@ -113,7 +128,7 @@ python -B -m unittest discover -s tests -v
 node tests/check_ui.cjs
 ```
 
-Python 测试覆盖 Anthropic 转换、OpenAI 请求体归一、HTTP 路由与鉴权、请求正文边界、凭证与账号库读写、积分解析、模型勾选竞态、模型目录缓存合并、Responses 协议收尾、用量文件抗损坏和日志脱敏。Node.js 检查验证网页脚本语法、无外链资源、DOM 引用完整性，以及配置生成（Anthropic 使用根地址、实际模型 ID 及访问密钥，Codex 使用 Responses 接口）；不包含浏览器布局测试。
+Python 测试覆盖 Anthropic 转换、OpenAI 请求体归一、HTTP 路由与鉴权、请求正文边界、凭证与账号库读写、积分解析、模型勾选竞态、模型目录缓存合并、Responses 协议收尾、用量文件抗损坏、日志脱敏，以及国际版出站身份（会话头族、ID 形态、5.8.4 版本/UA 与国内版不受影响）。Node.js 检查验证网页脚本语法、无外链资源、DOM 引用完整性，以及配置生成（Anthropic 使用根地址、实际模型 ID 及访问密钥，Codex 使用 Responses 接口）；不包含浏览器布局测试。
 
 ## 已知限制
 
