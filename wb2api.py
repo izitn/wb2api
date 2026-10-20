@@ -34,6 +34,8 @@ import json
 import math
 import os
 import secrets
+import shlex
+import shutil
 import ssl
 import subprocess
 import sys
@@ -82,19 +84,45 @@ REFRESH_SKEW = 300        # 到期前 5 分钟主动刷新
 REFRESH_AHEAD = 900       # 后台线程提前 15 分钟刷新，请求路径上基本不再同步刷新
 REFRESH_BACKOFF = 60      # 刷新失败后的冷却，避免每个请求都卡 30s 超时
 UPSTREAM_TIMEOUT = 300
-UPSTREAM_RETRIES = 2      # 首字节之前对 429/5xx/连接错误的重试次数
-RETRY_STATUS = (429, 500, 502, 503, 504)
+UPSTREAM_RETRIES = 2      # 对 429 与确认未发送请求的建连失败最多重试次数
 RETRY_BASE_DELAY = 0.5    # 首次重试等待秒数；之后按 RETRY_FACTOR 指数退避
 RETRY_FACTOR = 3.0
 RETRY_MAX_DELAY = 8.0     # 退避超过该值就不再重试，直接把错误交给客户端
 MODELS_TTL = 600
+# --- 账号池 ---
+# 只在国内版/国际版各自池内换号，绝不跨池：两个区域的 token 与上游域都不同，
+# 混池会把请求发到错误的上游。
+POOL_ENABLED = os.environ.get("WB_POOL", "1") not in ("", "0", "false", "False")
 MAX_BODY = 16 * 1024 * 1024
-def _env_int(name: str, default: int, minimum: int = 0) -> int:
+def _env_int(name: str, default: int, minimum: int = 0,
+             maximum: int | None = None) -> int:
     try:
         value = int(os.environ.get(name, "") or default)
     except (TypeError, ValueError):
         return default
+    value = max(minimum, value)
+    return min(maximum, value) if maximum is not None else value
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        value = float(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
     return max(minimum, value)
+
+
+# --- 账号池 ---
+POOL_SOFT_COOLDOWN = _env_float("WB_POOL_SOFT_COOLDOWN", 600)   # 429 等：指数退避，起点 600s
+POOL_SOFT_MAX = _env_float("WB_POOL_SOFT_MAX", 7200)            # 软冷却封顶
+POOL_HARD_COOLDOWN = _env_float("WB_POOL_HARD_COOLDOWN", 0)     # 0 表示硬错误用默认
+POOL_FAIL_THRESHOLD = _env_int("WB_POOL_FAIL_THRESHOLD", 3, 1)  # 连续失败多少次熔断
+POOL_BREAKER = _env_float("WB_POOL_BREAKER", 1800)
+POOL_STICKY_TTL = _env_float("WB_POOL_STICKY_TTL", 1800)
+POOL_STICKY_MAX = _env_int("WB_POOL_STICKY_MAX", 4096, 1)
+POOL_MAX_SWITCH = _env_int("WB_POOL_MAX_SWITCH", 3)
 
 
 MAX_INFLIGHT = _env_int("WB_MAX_INFLIGHT", 32, 1)   # 同时在途的对话请求上限
@@ -179,6 +207,16 @@ _STARTUP_LEGACY_VALUES = ("wb2oai-lite",)   # 改名前的启动项，迁移时�
 _STARTUP_REGISTRY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _api_key_persisted = False  # 密钥是否已持久化（来自文件或刚生成并落盘）
 
+# --- 账号池状态 ---
+# 每个账号一条健康记录：冷却到期时间、连续失败次数、熔断到期时间、最近一次错误。
+# 换号只发生在向客户端写出任何字节之前，流式请求中途失败不会二次换号。
+_pool_lock = threading.RLock()
+_pool_health: dict[str, dict] = {}
+# 会话粘性：会话键 → (账号 id, 过期时间)。同一对话尽量落在同一账号，
+# 既符合官方客户端"一个会话一台设备"的语义，也避免多轮上下文在两个池成员间跳变。
+_pool_sticky: dict[str, tuple[str, float]] = {}
+_pool_stats = {"switch": 0, "exhausted": 0}
+
 
 def settings_file() -> str:
     return _data_path("WB_SETTINGS_FILE", "settings.json")
@@ -241,7 +279,7 @@ def _billing_payload(obj):
 
 
 def _billing_post(a: dict, path: str, body: dict | None = None):
-    """账单走账号所属官网域；支持业务码、HTTP 错误和一次令牌刷新。"""
+    """账单走账号所属官网域；只读查询遇到传输抖动时最多安全重试一次。"""
     with _lock:
         a = dict(_accounts.get(account_id(a)) or a)
     refreshed = False
@@ -249,18 +287,28 @@ def _billing_post(a: dict, path: str, body: dict | None = None):
         refreshed = True
         refresh_auth(a, stale_token=a.get("accessToken"))
     base = _billing_base(a)
-    for attempt in range(2):
+    readonly = path != "/v2/billing/meter/daily-checkin"
+    transport_retries = 1 if readonly else 0
+    transport_attempt = 0
+    while True:
         headers = common_headers(a)
         headers.update({"Origin": base, "Referer": base + "/profile/plans-usage",
                         "X-Client-Platform": "web", "Accept": "application/json, text/plain, */*"})
         if a.get("enterpriseId"):
             headers["X-Tenant-Id"] = a["enterpriseId"]
-        resp = upstream_request("POST", base + path, headers,
-                                json.dumps(body or {}).encode("utf-8"), 15)
         try:
-            raw = resp.read()
-        finally:
-            resp.close()
+            resp = upstream_request("POST", base + path, headers,
+                                    json.dumps(body or {}).encode("utf-8"), 15)
+            try:
+                raw = resp.read()
+            finally:
+                resp.close()
+        except (OSError, http.client.HTTPException):
+            if transport_attempt >= transport_retries:
+                raise
+            transport_attempt += 1
+            time.sleep(0.2)
+            continue
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeError):
@@ -270,7 +318,7 @@ def _billing_post(a: dict, path: str, body: dict | None = None):
         code = str(payload.get("code", 0 if "data" in payload or "Response" in payload else -1))
         message = str(payload.get("message") or payload.get("msg") or "积分服务返回错误码 %s" % code)
         unauthorized = resp.status in (401, 403) or code in ("401", "403")
-        if unauthorized and not attempt and not refreshed and a.get("refreshToken"):
+        if unauthorized and not refreshed and a.get("refreshToken"):
             refreshed = True
             if refresh_auth(a, stale_token=a.get("accessToken")):
                 continue
@@ -486,6 +534,58 @@ def _supports_checkin(a):
     return realm_of(a) == "cn" and not a.get("enterpriseId")
 
 
+#: 上游"今天已经签过"的业务码。10001 来自 hub 的实测；14001 来自 panel 的实测
+#: （panel 的 IsAlreadyCheckin 用它判定幂等拒绝）。两者都按"已签到"处理，
+#: 否则重启补签时会把一个正常状态报成失败。
+CHECKIN_ALREADY_CODES = ("10001", "14001")
+#: 文案兜底。只放明确表达"已经签过"的短语：裸 "already" 会误伤
+#: "already in progress" 这类瞬时错误，把失败记成成功。
+CHECKIN_ALREADY_MARKERS = ("已签到", "今天已签到", "already checked in", "already signed in")
+
+
+def _checkin_already(e: "BillingError") -> bool:
+    """判断上游拒绝是否只是"今天已经签过了"（幂等，不是失败）。
+
+    只认带分类的业务错误：网络层/解析层错误绝不能当成"已签到"，
+    否则停机补签遇到抖动会误记成功，账号当天其实没签到。
+    """
+    if not isinstance(e, BillingError):
+        return False
+    if e.code in CHECKIN_ALREADY_CODES:
+        return True
+    msg = str(e)
+    low = msg.lower()
+    return any(m in msg or m.lower() in low for m in CHECKIN_ALREADY_MARKERS)
+
+
+def _checkin_transient(e) -> bool:
+    """上游 5xx / 连接抖动值得重试；业务错误重试只会原样再失败一次。"""
+    if isinstance(e, BillingError):
+        return e.status >= 500
+    return isinstance(e, (OSError, http.client.HTTPException))
+
+
+def _billing_post_checkin(a: dict) -> None:
+    """提交每日签到。瞬时 5xx 有界重试（共 3 次），业务错误立即放弃。
+
+    上游偶发返回 HTTP 500 / code 10000（"API request failed with status code: 500"），
+    这类抖动重试一次通常就成功；而"今日已签到"之类的业务拒绝重试没有意义。
+    """
+    last = None
+    for attempt in range(3):
+        try:
+            _billing_post(a, "/v2/billing/meter/daily-checkin")
+            return
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if not _checkin_transient(e) or _checkin_already(e):
+                raise
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    if last is not None:
+        raise last
+
+
 def daily_checkin(a: dict) -> dict:
     aid = account_id(a)
     if not _supports_checkin(a):
@@ -513,9 +613,9 @@ def daily_checkin(a: dict) -> dict:
             already = checked
             if not checked:
                 try:
-                    _billing_post(a, "/v2/billing/meter/daily-checkin")
+                    _billing_post_checkin(a)
                 except BillingError as e:
-                    if e.code == "10001" or "已签到" in str(e) or "already checked in" in str(e).lower():
+                    if _checkin_already(e):
                         already = True
                     else:
                         raise
@@ -574,7 +674,101 @@ def _startup_command() -> str:
         cmd.append("--no-ui")
     if HIDE_REASONING:
         cmd.append("--hide-reasoning")
-    return subprocess.list2cmdline(cmd)
+    return subprocess.list2cmdline(cmd) if os.name == "nt" else shlex.join(cmd)
+
+
+# --- Linux：systemd 用户单元 -------------------------------------------------
+# 只用「用户级」单元（~/.config/systemd/user），不需要 sudo、也不改系统目录。
+# 用户级单元还需要 `loginctl enable-linger` 才能在未登录时启动，这一点在
+# message 里明确告诉用户，不偷偷改系统状态。
+_SYSTEMD_UNIT = "wb2api-lite.service"
+
+
+def _systemd_dir() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "systemd", "user")
+
+
+def _systemd_path() -> str:
+    return os.path.join(_systemd_dir(), _SYSTEMD_UNIT)
+
+
+def _systemd_available() -> bool:
+    """有 systemd 且 systemctl 可用（WSL / 容器里通常没有）。"""
+    return bool(shutil.which("systemctl")) and os.path.isdir("/run/systemd/system")
+
+
+def _systemd_unit_text() -> str:
+    args = [os.path.abspath(sys.executable), os.path.abspath(__file__),
+            "--host", _BIND_HOST, "--port", str(_PORT),
+            "--data-dir", os.path.abspath(DATA_DIR), "--auth", os.path.abspath(AUTH_FILE)]
+    if not _SERVE_UI:
+        args.append("--no-ui")
+    if HIDE_REASONING:
+        args.append("--hide-reasoning")
+    # systemd 的 ExecStart 不是 shell，逐项加引号转义
+    exec_start = " ".join(shlex.quote(x) for x in args)
+    return (
+        "[Unit]\n"
+        "Description=wb2api-lite local proxy\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "ExecStart=%s\n"
+        "WorkingDirectory=%s\n"
+        "Restart=on-failure\n"
+        "RestartSec=5\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    ) % (exec_start, os.path.abspath(DATA_DIR))
+
+
+def _linux_startup_status() -> dict:
+    if not _systemd_available():
+        return {"ok": True, "supported": False, "enabled": False,
+                "message": "当前 Linux 环境没有 systemd（WSL/容器常见），"
+                           "请用 systemd、tmux、nohup 或容器编排自行常驻"}
+    path = _systemd_path()
+    enabled = os.path.isfile(path)
+    return {"ok": True, "supported": True, "enabled": enabled,
+            "path": path,
+            "message": ("wb2api 已启用 Linux 用户级自启（%s）" % path) if enabled
+            else "wb2api 未启用 Linux 用户级自启"}
+
+
+def _linux_set_startup(enabled: bool) -> dict:
+    if not _systemd_available():
+        return {**_linux_startup_status(), "ok": False}
+    path = _systemd_path()
+    try:
+        if enabled:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(_systemd_unit_text())
+            subprocess.run(["systemctl", "--user", "daemon-reload"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+            subprocess.run(["systemctl", "--user", "enable", _SYSTEMD_UNIT],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        else:
+            subprocess.run(["systemctl", "--user", "disable", _SYSTEMD_UNIT],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            subprocess.run(["systemctl", "--user", "daemon-reload"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        result = _linux_startup_status()
+        if result.get("enabled") != enabled:
+            result.update(ok=False, message="systemd 单元写入后状态未生效，请检查 ~/.config/systemd 权限")
+        elif enabled:
+            result["message"] += "；注销后仍需运行，请执行：loginctl enable-linger $USER"
+        return result
+    except Exception as e:  # noqa: BLE001
+        return {**_linux_startup_status(), "ok": False, "message": "设置 Linux 自启失败：" + str(e)}
 
 
 def _drop_legacy_startup_values() -> None:
@@ -593,7 +787,7 @@ def _drop_legacy_startup_values() -> None:
 
 def startup_status() -> dict:
     if os.name != "nt":
-        return {"ok": True, "supported": False, "enabled": False, "message": "仅支持 Windows 开机自启"}
+        return _linux_startup_status()
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REGISTRY, 0, winreg.KEY_READ) as key:
@@ -621,7 +815,13 @@ def startup_status() -> dict:
 
 def set_startup(enabled: bool) -> dict:
     if os.name != "nt":
-        return {**startup_status(), "ok": False}
+        if enabled and not _api_key_persisted:
+            return {
+                "ok": False, "supported": True, "enabled": False,
+                "message": "当前访问密钥来自命令行参数或环境变量，重启后会丢失。"
+                           "请移除 --api-key 或 WB_API_KEY，让程序自动生成并保存密钥文件后再开启自启",
+            }
+        return _linux_set_startup(enabled)
     # 检查密钥是否已持久化：非持久化密钥在重启后会丢失，必须拒绝
     if enabled and not _api_key_persisted:
         return {
@@ -666,14 +866,24 @@ def log(msg: str) -> None:
 
 
 def stable_id(uid: str, purpose: str) -> str:
-    """按 uid 稳定派生 36 位十六进制设备/会话标识。
+    """按 uid 稳定派生带连字符的 UUID 形状设备/会话标识。
 
-    同账号跨重启恒定、不同账号互异 —— 官方桌面端对每个账号就是一台固定设备，
-    这里用固定盐复现，避免多账号被上游按设备指纹漂移关联。
+    技术路线对齐官方客户端抓包（参见同类项目 wb_fingerprint.derive_id 的做法）：
+    真实客户端的 X-Machine-ID / X-Session-ID 都是**带连字符的 UUID**，不是 36 位
+    无连字符的裸 hex。裸 hex 这种形态上游见不到，本身就是一处"网关特征"。
 
+    取值仍然按账号派生，这是与官方客户端的关键差异：官方"一个进程=一台设备"，
+    而本程序是一个长驻进程同时代表多个账号。若按进程维度取一次，所有账号会共用
+    同一个 machineId，反而把它们关联到同一台机器上，与"每账号一台设备"相悖。
+
+    幂等：同一账号跨重启恒定、不同账号互异。
     盐值故意保留改名前的字面量，改名不应让已保存账号的设备指纹发生变化。
     """
-    return hashlib.sha256(("wb2oai:%s:%s" % (purpose, uid)).encode()).hexdigest()[:36]
+    seed = "wb2oai:%s:%s" % (purpose, uid)
+    h = hashlib.sha256(seed.encode()).hexdigest()
+    # 与 hub 的实现保持一致：把版本位固定成 4、变体位固定成 a，凑成 UUIDv4 形状
+    h = h[:12] + "4" + h[13:16] + "a" + h[17:]
+    return "%s-%s-%s-%s-%s" % (h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
 
 
 def to_int(v) -> int:
@@ -949,6 +1159,233 @@ def ensure_auth() -> dict:
         return a           # 快路径：不碰锁
     refresh_auth(a, stale_token=a.get("accessToken"))
     return a
+
+
+# ===========================================================================
+# 三之二、账号池：国内版 / 国际版双池，池内自动换号 + 会话粘性
+# ===========================================================================
+# 设计约束（改这里之前请先读）：
+#   1. 双池物理隔离——不同 realm 的 token、上游域、出站身份都不同，绝不跨池。
+#   2. 只在"还没给客户端写出任何字节"时换号；流式请求开始收尾后不能再换。
+#   3. 换号只改变"这次请求用哪个账号"，**不改** _auth（控制台上的当前账号）。
+#      当前账号是用户的选择，账号池是负载与容错策略，两者不能互相覆盖。
+#   4. 同一会话尽量粘在同一账号；粘性账号不可用时会解绑并改投他人。
+
+def _pool_realm(a: dict | None) -> str:
+    return realm_of(a)
+
+
+def _pool_members(realm: str) -> list[dict]:
+    """某个池的成员：该 realm 下所有可用账号（按 id 排序保证选择稳定）。"""
+    with _lock:
+        accounts = dict(_accounts)
+        if _auth:
+            accounts[account_id(_auth)] = _auth
+    members = [a for a in accounts.values() if realm_of(a) == realm and a.get("accessToken")]
+    members.sort(key=account_id)
+    return members
+
+
+def _health(aid: str) -> dict:
+    with _pool_lock:
+        h = _pool_health.get(aid)
+        if h is None:
+            h = {"cooldownUntil": 0.0, "fails": 0, "breakerUntil": 0.0, "lastError": "", "softCount": 0}
+            _pool_health[aid] = h
+        return h
+
+
+def _pool_available(aid: str, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    h = _health(aid)
+    with _pool_lock:
+        return h["cooldownUntil"] <= now and h["breakerUntil"] <= now
+
+
+def _pool_pick(realm: str, session_key: str = "", exclude: set | None = None) -> dict | None:
+    """在指定池内挑一个可用账号。
+
+    优先级：会话粘性命中 > 当前账号（让单账号用户行为完全不变）> 池内其余可用账号。
+    """
+    exclude = exclude or set()
+    members = _pool_members(realm)
+    if not members:
+        return None
+    by_id = {account_id(m): m for m in members}
+    now = time.time()
+    # 1) 会话粘性
+    if session_key:
+        with _pool_lock:
+            hit = _pool_sticky.get(session_key)
+            if hit and hit[1] <= now:
+                _pool_sticky.pop(session_key, None)   # 过期即清
+                hit = None
+        # 注意：_pool_available 自己也会取 _pool_lock，不要在上面的 with 里调用它
+        if hit and hit[1] > now:
+            aid = hit[0]
+            if aid in by_id and aid not in exclude and _pool_available(aid, now):
+                return by_id[aid]
+    # 2) 当前账号优先：只有一个账号的人不会感到任何变化
+    cur = _auth
+    if cur is not None and realm_of(cur) == realm:
+        cid = account_id(cur)
+        if cid in by_id and cid not in exclude and _pool_available(cid, now):
+            return by_id[cid]
+    # 3) 池内轮转：跳过冷却/熔断的账号
+    for aid in by_id:
+        if aid in exclude:
+            continue
+        if _pool_available(aid, now):
+            return by_id[aid]
+    return None
+
+
+def _pool_bind(session_key: str, aid: str) -> None:
+    if not session_key:
+        return
+    now = time.time()
+    with _pool_lock:
+        if len(_pool_sticky) >= POOL_STICKY_MAX:
+            # 简单淘汰：先清过期，仍然超限就丢掉最早到期的那批
+            dead = [k for k, v in _pool_sticky.items() if v[1] <= now]
+            for k in dead:
+                _pool_sticky.pop(k, None)
+            if len(_pool_sticky) >= POOL_STICKY_MAX:
+                for k, _ in sorted(_pool_sticky.items(), key=lambda kv: kv[1][1])[:POOL_STICKY_MAX // 4]:
+                    _pool_sticky.pop(k, None)
+        _pool_sticky[session_key] = (aid, now + POOL_STICKY_TTL)
+
+
+def _pool_unbind(session_key: str, aid: str) -> None:
+    """粘性账号失效时解绑，下次请求才能改投他人。"""
+    if not session_key:
+        return
+    with _pool_lock:
+        hit = _pool_sticky.get(session_key)
+        if hit and hit[0] == aid:
+            _pool_sticky.pop(session_key, None)
+
+
+def _pool_mark_ok(a: dict) -> None:
+    h = _health(account_id(a))
+    with _pool_lock:
+        h["fails"] = 0
+        h["softCount"] = 0
+        h["lastError"] = ""
+
+
+def _pool_penalize(a: dict, status: int, reason: str) -> bool:
+    """记录一次失败并决定该账号是否应被移出轮转。返回是否真的惩罚了。"""
+    aid = account_id(a)
+    h = _health(aid)
+    now = time.time()
+    with _pool_lock:
+        h["lastError"] = (reason or "")[:200]
+        if status == 429:
+            # 软冷却：指数退避，封顶 POOL_SOFT_MAX。
+            # softCount 必须夹紧：2**n 无上限时，反复命中 429 会把指数顶到
+            # float 溢出，直接把请求线程打挂（OverflowError）。
+            h["softCount"] = min(h["softCount"] + 1, 30)
+            delay = min(POOL_SOFT_COOLDOWN * (2 ** (h["softCount"] - 1)), POOL_SOFT_MAX)
+            h["cooldownUntil"] = max(h["cooldownUntil"], now + delay)
+            return True
+        if status in (401, 403):
+            # 授权类：立刻冷却，等令牌刷新或用户重新登录；不计入熔断
+            h["cooldownUntil"] = max(h["cooldownUntil"], now + POOL_SOFT_COOLDOWN)
+            return True
+        if status == 402:
+            # 余额/积分不足：硬冷却较久（默认 1 小时），别在它身上反复烧请求
+            h["cooldownUntil"] = max(h["cooldownUntil"],
+                                     now + (POOL_HARD_COOLDOWN or 3600))
+            return True
+        if status >= 500:
+            h["fails"] += 1
+            if h["fails"] >= POOL_FAIL_THRESHOLD:
+                h["breakerUntil"] = now + POOL_BREAKER
+                h["fails"] = 0
+                log("账号池：%s 连续失败，熔断 %.0f 分钟" % (account_name(a) or aid[:8], POOL_BREAKER / 60))
+            return True
+        return False
+
+
+def pool_status() -> dict:
+    """控制台展示用：按两池汇总成员与健康状态。"""
+    now = time.time()
+    out = {}
+    for realm in REALMS:
+        rows = []
+        for m in _pool_members(realm):
+            aid = account_id(m)
+            h = _health(aid)
+            with _pool_lock:
+                rows.append({
+                    "accountId": aid,
+                    "name": account_name(m) or aid[:8],
+                    "available": h["cooldownUntil"] <= now and h["breakerUntil"] <= now,
+                    "cooldownIn": max(0, int(h["cooldownUntil"] - now)),
+                    "breakerIn": max(0, int(h["breakerUntil"] - now)),
+                    "fails": h["fails"],
+                    "lastError": h["lastError"],
+                    "active": bool(_auth and account_id(_auth) == aid),
+                })
+        out[realm] = {"count": len(rows), "available": sum(1 for r in rows if r["available"]),
+                      "members": rows}
+    out["enabled"] = POOL_ENABLED
+    with _pool_lock:
+        out["stickyCount"] = len(_pool_sticky)
+        out["stats"] = dict(_pool_stats)
+    return out
+
+
+def _pool_session_key(handler) -> str:
+    """从请求里提取稳定的会话标识，用于会话粘性。
+
+    优先显式头（客户端自己带）；其次 OpenAI 语义上的 user 字段是每个请求都变的，
+    不能用；最后退回连接级 cookie，保证同一个客户端连接组落在同一账号。
+    """
+    for name in ("X-Session-Id", "X-Conversation-Id", "Session-Id", "X-Claude-Code-Session"):
+        v = handler.headers.get(name)
+        if v and v.strip():
+            return "h:" + v.strip()[:128]
+    return ""
+
+
+#: 这些状态码意味着"换一个账号可能就好了"；其余 4xx 是请求本身的问题，
+#: 换号只会把同一个错误在池里跑一遍，徒增上游请求与积分消耗。
+POOL_SWITCH_STATUS = frozenset((401, 402, 403, 429, 500, 502, 503, 504))
+
+
+def _pool_can_switch(a: dict, status: int, tried: set) -> bool:
+    """判断这次的失败是否值得换号。"""
+    if not POOL_ENABLED:
+        return False
+    if status not in POOL_SWITCH_STATUS:
+        return False
+    if len(tried) >= POOL_MAX_SWITCH:
+        return False
+    return bool(_pool_members(realm_of(a)))
+
+
+def _pool_switch(a: dict, status: int, reason: str, session_key: str,
+                 tried: set) -> dict | None:
+    """惩罚当前账号并在同池内改投一个可用账号；没有可用账号时返回 None。"""
+    aid = account_id(a)
+    tried.add(aid)
+    _pool_penalize(a, status, reason)
+    # 粘性账号刚失败：解绑，否则下一次请求还会被粘回这个坏账号
+    _pool_unbind(session_key, aid)
+    nxt = _pool_pick(realm_of(a), session_key, exclude=tried)
+    if nxt is None:
+        with _pool_lock:
+            _pool_stats["exhausted"] += 1
+        log("账号池：%s 池内已无可用账号（本次请求失败于 HTTP %s）"
+            % (REALMS[realm_of(a)]["label"], status))
+        return None
+    with _pool_lock:
+        _pool_stats["switch"] += 1
+    log("账号池：HTTP %s，%s → %s 换号重试"
+        % (status, account_name(a) or aid[:8], account_name(nxt) or account_id(nxt)[:8]))
+    return nxt
 
 
 def _refresher_loop() -> None:
@@ -1920,19 +2357,27 @@ def upstream_request(method: str, url: str, headers: dict, body: bytes | None = 
     https = u.scheme == "https"
     port = u.port or (443 if https else 80)
     target = (u.path or "/") + ("?" + u.query if u.query else "")
-    key, conn, _reused = POOL.get(u.scheme, u.hostname, port, timeout)
-    try:
+    for attempt in range(2):
+        key, conn, reused = POOL.get(u.scheme, u.hostname, port, timeout)
         try:
-            conn.connect()
-        except (OSError, http.client.HTTPException) as e:
-            e.wb2api_retry_safe = True
+            if conn.sock is None:
+                try:
+                    conn.connect()
+                except (OSError, http.client.HTTPException) as e:
+                    e.wb2api_retry_safe = True
+                    raise
+            conn.request(method, target, body=body, headers=headers)
+            r = conn.getresponse()
+        except (ConnectionError, http.client.BadStatusLine) as e:
+            conn.close()
+            if reused and attempt == 0 and getattr(e, "wb2api_retry_safe", False):
+                continue
             raise
-        conn.request(method, target, body=body, headers=headers)
-        r = conn.getresponse()
-    except BaseException:
-        conn.close()
-        raise
-    return UpstreamResponse(key, conn, r)
+        except BaseException:
+            conn.close()
+            raise
+        return UpstreamResponse(key, conn, r)
+    raise ConnectionError("无法连接上游")  # pragma: no cover
 
 
 def http_json(method: str, url: str, headers: dict, body: bytes | None = None, timeout: float = 30):
@@ -1955,15 +2400,11 @@ class UpstreamError(Exception):
         self.retry_after = retry_after
 
 
-def _discard(resp) -> None:
-    try:
-        resp.read()
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        resp.close()
-    except Exception:  # noqa: BLE001
-        pass
+def _looks_like_gzip_rejection(status: int, body: bytes) -> bool:
+    if status not in (400, 415):
+        return False
+    text = body[:4096].decode("utf-8", "replace").lower()
+    return "gzip" in text or "content-encoding" in text or "decompress" in text
 
 
 class _BufferedResponse:
@@ -1977,15 +2418,24 @@ class _BufferedResponse:
         body, self._body = self._body, b""
         return body
 
+    def __iter__(self):
+        body, self._body = self._body, b""
+        for line in body.splitlines(True):
+            yield line
+
     def close(self):
         self._response.close()
 
 
-def _looks_like_gzip_rejection(status: int, body: bytes) -> bool:
-    if status not in (400, 415):
-        return False
-    text = body[:4096].decode("utf-8", "replace").lower()
-    return "gzip" in text or "content-encoding" in text or "decompress" in text
+def _discard(resp) -> None:
+    try:
+        resp.read()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        resp.close()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _retry_delay(resp, attempt: int) -> float:
@@ -2012,15 +2462,17 @@ _chat_paths: dict[str, str] = {}  # 按上游域名记住路径，国内外请�
 
 
 def call_upstream(payload: dict, a: dict) -> UpstreamResponse:
-    """调用上游；只重试可确认尚未写出请求的连接错误与明确的 429。"""
+    """调用上游；只重试可确认安全的连接建立失败与 429。"""
     base = upstream_base(a)
     chat_path = _chat_paths.get(base, CHAT_PATH)
     # ensure_ascii=True：代码/英文为主的上下文序列化快 3~4 倍；体积膨胀的部分 gzip 会吃掉
-    data = json.dumps(payload, separators=(",", ":")).encode("ascii")
+    request_id = payload.get("_wb2api_request_id") or _uuid7().hex
+    upstream_payload = {key: value for key, value in payload.items()
+                        if key != "_wb2api_request_id"}
+    data = json.dumps(upstream_payload, separators=(",", ":")).encode("ascii")
     gz = _gzip(data) if _gzip_ok and not _gzip_disabled(base) and len(data) >= GZIP_MIN else None
     refreshed = tried_alt = False
     attempt = 0
-    request_id = _uuid7().hex
     while True:
         token = a.get("accessToken")
         url = base + chat_path
@@ -2837,6 +3289,7 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
     output: list = []
     cur: dict | None = None
     tools: dict[int, dict] = {}
+    terminal_frames: dict[int, list[tuple[str, dict]]] = {}
     def ev(name, payload):
         payload = dict(payload)
         payload["type"] = name
@@ -2885,16 +3338,13 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
                 ("response.content_part.done", {
                 "item_id": item["id"], "output_index": idx, "content_index": 0, "part": part})]
         terminal.append(("response.output_item.done", {"output_index": idx, "item": item}))
-        for name, payload in terminal:
-            if name == "response.output_item.done" and payload["item"].get("type") == "message":
-                payload["item"]["status"] = "completed"
-            yield ev(name, payload)
+        terminal_frames[idx] = terminal
 
     def text_delta(kind, text):
         nonlocal cur
         if cur is None or cur["kind"] != kind:
             if cur is not None:
-                yield from close_item(cur)
+                close_item(cur)
             cur, frames = open_item(kind)
             yield from frames
         cur["buf"].append(text)
@@ -2925,8 +3375,11 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
         yield ev("response.output_item.added", {"output_index": t["idx"], "item": dict(item)})
         buffered = slot["function"]["arguments"]
         if buffered and item["type"] == "function_call":
+            item["arguments"] = buffered
             yield ev("response.function_call_arguments.delta", {
                 "item_id": item["id"], "output_index": t["idx"], "delta": buffered})
+        elif buffered and item["type"] == "custom_tool_call":
+            item["input"] = buffered
 
     def close_tools():
         pending = [t for t in tools.values() if t["idx"] is None]
@@ -2948,8 +3401,7 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
                 terminal.append(("response.custom_tool_call_input.done", {
                     "item_id": final["id"], "output_index": t["idx"], "input": final["input"]}))
             terminal.append(("response.output_item.done", {"output_index": t["idx"], "item": final}))
-            for name, payload in terminal:
-                yield ev(name, payload)
+            terminal_frames[t["idx"]] = terminal
 
     yield ev("response.created", {"response": snapshot("in_progress", [])})
     yield ev("response.in_progress", {"response": snapshot("in_progress", [])})
@@ -2979,6 +3431,8 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
                     t["item"]["arguments"] = t["slot"]["function"]["arguments"]
                     yield ev("response.function_call_arguments.delta", {
                         "item_id": t["item"]["id"], "output_index": t["idx"], "delta": args})
+                elif args and t["open"] and t["item"]["type"] == "custom_tool_call":
+                    t["item"]["input"] = t["slot"]["function"]["arguments"]
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
         raise
     except Exception as e:  # noqa: BLE001 - 上游中途断流：给客户端一个明确的失败事件
@@ -3003,8 +3457,13 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
         return
 
     if cur is not None:
-        yield from close_item(cur)
+        close_item(cur)
     yield from close_tools()
+    for idx in sorted(terminal_frames):
+        for name, payload in terminal_frames[idx]:
+            if name == "response.output_item.done" and payload["item"].get("type") == "message":
+                payload["item"]["status"] = "completed"
+            yield ev(name, payload)
     status, details = _finish_status(finish)
     final = snapshot(status, output)
     final["output_text"] = "".join(
@@ -3924,6 +4383,10 @@ def admin_state() -> dict:
         out["points"] = {k: v for k, v in p.items() if k != "at"}
     out["autoCheckin"] = _auto_checkin
     out["startup"] = startup_status()
+    try:
+        out["pool"] = pool_status()
+    except Exception:  # noqa: BLE001 - 池统计失败不能拖垮整个面板首屏
+        out["pool"] = None
     return out
 
 
@@ -3940,8 +4403,8 @@ def health() -> dict:
     out = {"status": "ok", "upstream": upstream_base(a), "loggedIn": bool(a),
            "uptime": int(time.time() - _started_at), "inflight": inflight,
            "upstreamConns": {"created": POOL.created, "reused": POOL.reused},
-           "gzip": {"enabled": gzip_enabled,
-                    "disabledBases": gzip_disabled, "requests": gzip_requests,
+           "gzip": {"enabled": gzip_enabled, "disabledBases": gzip_disabled,
+                    "requests": gzip_requests,
                     "savedKB": gzip_saved // 1024}}
     if exp:
         out["tokenExpiresIn"] = int(exp - time.time())
@@ -3951,6 +4414,16 @@ def health() -> dict:
         out["modelsAge"] = int(time.time() - _models_cache["at"])
     if a and exp and exp - time.time() < 0:
         out["status"] = "degraded"
+    # 账号池概况：不加 --verbose 也能一眼看出是否还有可用账号
+    try:
+        st = pool_status()
+        realms = {realm: {"count": st[realm]["count"], "available": st[realm]["available"]}
+                  for realm in REALMS}
+        realms["enabled"] = st["enabled"]
+        realms["switches"] = st["stats"].get("switch", 0)
+        out["pool"] = realms
+    except Exception:  # noqa: BLE001 - 健康检查不能因为池统计出错而失败
+        pass
     return out
 
 
@@ -4111,6 +4584,54 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # 静音默认访问日志，只留我们自己的
         return
 
+    def _drain_chunked(self, max_bytes: int = 1024 * 1024,
+                       timeout: float = 0.5) -> None:
+        """有界尝试排空被拒绝的 chunked 正文，超限或超时即停止并关闭连接。"""
+        connection = getattr(self, "connection", None)
+        if connection is None:
+            return
+        old_timeout = connection.gettimeout()
+        total = 0
+        try:
+            connection.settimeout(timeout)
+            while total <= max_bytes:
+                line = self.rfile.readline(8192)
+                if not line or not line.endswith(b"\n"):
+                    return
+                if total + len(line) > max_bytes:
+                    return
+                total += len(line)
+                size_text = line.split(b";", 1)[0].strip()
+                try:
+                    size = int(size_text, 16)
+                except ValueError:
+                    return
+                if size < 0 or total + size + 2 > max_bytes:
+                    return
+                if size == 0:
+                    trailer_bytes = 0
+                    while trailer_bytes < 65536:
+                        trailer = self.rfile.readline(8192)
+                        if not trailer:
+                            return
+                        trailer_bytes += len(trailer)
+                        if trailer_bytes > 65536:
+                            return
+                        if trailer in (b"\r\n", b"\n"):
+                            return
+                    return
+                chunk = self.rfile.read(size + 2)
+                if len(chunk) != size + 2 or not chunk.endswith(b"\r\n"):
+                    return
+                total += len(chunk)
+        except (OSError, ValueError):
+            return
+        finally:
+            try:
+                connection.settimeout(old_timeout)
+            except OSError:
+                pass
+
     def _route(self) -> str:
         """取归一化后的路由路径。
 
@@ -4194,6 +4715,7 @@ class Handler(BaseHTTPRequestHandler):
     def _discard_request_body(self) -> None:
         """GET / OPTIONS 等不应带正文；带了就必须读完或断开，否则残留字节会被当成下一个请求。"""
         if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            self._drain_chunked()
             self.close_connection = True
             return
         lengths = self.headers.get_all("Content-Length") or []
@@ -4255,6 +4777,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, account_points(a, True))
             if path == "/admin/startup":
                 return self._json(200, startup_status())
+            if path == "/admin/pool":
+                return self._json(200, pool_status())
             if path == "/admin/models":
                 try:
                     a = ensure_auth()
@@ -4476,10 +5000,18 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             return self._error(400, str(e), "invalid_request_error")
         try:
-            a = ensure_auth()
+            ensure_auth()
         except Exception as e:  # noqa: BLE001
             msg = "未登录：%s —— 打开控制台或执行 --setup 登录" % e
             return self._error(401, msg, "authentication_error")
+
+        # 账号池：先按当前账号所在的池挑一个可用成员；池内换号只影响本次请求，
+        # 不改变控制台上的当前账号。
+        session_key = _pool_session_key(self)
+        try:
+            a = _pool_pick(realm_of(_auth), session_key) or ensure_auth()
+        except Exception:  # noqa: BLE001 - 池异常时退回原行为
+            a = ensure_auth()
 
         model, err = resolve_model(body.get("model"), a)
         if err:
@@ -4503,26 +5035,53 @@ class Handler(BaseHTTPRequestHandler):
         elif isinstance(body.get("n"), int) and body["n"] > 1:
             return self._error(400, "上游不支持一次生成多个候选结果（n > 1）", "invalid_request_error")
 
-        payload = normalize_chat_body(body, a)
         t0 = time.time()
         acc = ChatAccumulator()
         status, ttft = 200, None
+        tried: set[str] = set()
+        logical_request_id = _uuid7().hex
+        resp = None
         try:
-            try:
-                resp = call_upstream(payload, a)
-            except UpstreamError as e:
-                status = e.status
-                return self._error(e.status, e.msg, retry_after=e.retry_after)
-            except Exception as e:  # noqa: BLE001
-                status = 502
-                msg = "无法连接上游：%s" % e
-                return self._error(502, msg)
+            # --- 换号循环：只在写出任何字节之前换号 ---
+            while True:
+                payload = normalize_chat_body(dict(body), a)
+                payload["model"] = model
+                payload["_wb2api_request_id"] = logical_request_id
+                try:
+                    resp = call_upstream(payload, a)
+                except UpstreamError as e:
+                    status = e.status
+                    if _pool_can_switch(a, e.status, tried):
+                        nxt = _pool_switch(a, e.status, e.msg, session_key, tried)
+                        if nxt is not None:
+                            a = nxt
+                            continue
+                    return self._error(e.status, e.msg, retry_after=e.retry_after)
+                except Exception as e:  # noqa: BLE001
+                    status = 502
+                    if getattr(e, "wb2api_retry_safe", False) and _pool_can_switch(a, 502, tried):
+                        nxt = _pool_switch(a, 502, str(e), session_key, tried)
+                        if nxt is not None:
+                            a = nxt
+                            continue
+                    msg = "无法连接上游：%s" % e
+                    return self._error(502, msg)
 
-            if resp.status >= 400 or not is_sse(resp):
-                ra = resp.headers.get("Retry-After") or ""
-                status, msg = read_error(resp)
-                log("上游 %s：%s" % (status, msg))
-                return self._error(status, msg, retry_after=ra)
+                if resp.status >= 400 or not is_sse(resp):
+                    ra = resp.headers.get("Retry-After") or ""
+                    status, msg = read_error(resp)
+                    log("上游 %s：%s" % (status, msg))
+                    if _pool_can_switch(a, status, tried):
+                        nxt = _pool_switch(a, status, msg, session_key, tried)
+                        if nxt is not None:
+                            a = nxt
+                            continue
+                    return self._error(status, msg, retry_after=ra)
+                break
+
+            # 成功拿到可用的上游响应：记健康、绑定粘性
+            _pool_mark_ok(a)
+            _pool_bind(session_key, account_id(a))
 
             rid = "resp_" + uuid.uuid4().hex[:24]
             if want_stream:
@@ -4934,7 +5493,8 @@ def main() -> None:
     ap._optionals.title = "可选参数"
     ap.add_argument("-h", "--help", action="help", help="显示帮助并退出")
     ap.add_argument("--host", default=os.environ.get("WB_HOST", "127.0.0.1"), help="监听地址，默认 127.0.0.1")
-    ap.add_argument("--port", type=int, default=_env_int("WB_PORT", 8787, 1), help="监听端口，默认 8787")
+    ap.add_argument("--port", type=int, default=_env_int("WB_PORT", 8787, 1, 65535),
+                    help="监听端口，默认 8787")
     ap.add_argument("--data-dir", default="",
                     help="状态文件目录（auth.json / api_key.txt / selection.json 等），默认脚本所在目录")
     ap.add_argument("--auth", default="", help="凭证文件路径（默认 <data-dir>/auth.json）")

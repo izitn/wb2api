@@ -59,10 +59,33 @@ class ResponsesStreamTests(unittest.TestCase):
         self.assertNotIn("response.output_item.done", body)
         self.assertIn("finish_reason", acc.error)
 
+    def test_missing_finish_reason_does_not_emit_item_done(self):
+        body, _ = self.run_stream(text_chunks(finish=None))
+        self.assertNotIn("response.output_item.done", body)
+
     def test_normal_stream_completes(self):
         body, acc = self.run_stream(text_chunks())
         self.assertIn("response.completed", body)
         self.assertNotIn("response.failed", body)
+
+    def test_done_snapshot_matches_final_output(self):
+        body, _ = self.run_stream(text_chunks())
+        events = [json.loads(line[6:]) for line in body.splitlines()
+                  if line.startswith("data: {")]
+        item_done = next(e["item"] for e in events
+                         if e.get("type") == "response.output_item.done")
+        completed = next(e["response"]["output"] for e in events
+                         if e.get("type") == "response.completed")
+        self.assertEqual(item_done, completed[0])
+
+    def test_partial_text_is_retained_but_not_marked_done(self):
+        chunks = text_chunks(finish=None)
+        body, _ = self.run_stream(chunks)
+        events = [json.loads(line[6:]) for line in body.splitlines()
+                  if line.startswith("data: {")]
+        failed = next(e["response"] for e in events if e.get("type") == "response.failed")
+        self.assertEqual(failed["output"][0]["content"][0]["text"], "你好")
+        self.assertNotIn("response.output_text.done", body)
 
     def test_length_finish_is_incomplete(self):
         body, _ = self.run_stream(text_chunks(finish="length"))

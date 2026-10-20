@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -41,6 +42,45 @@ class BillingEnvelopeTests(unittest.TestCase):
         self.assertEqual(wb._billing_payload([1, 2]), [1, 2])
         self.assertEqual(wb._billing_payload("text"), "text")
         self.assertEqual(wb._billing_payload(None), None)
+
+
+class BillingTransportTests(unittest.TestCase):
+    def setUp(self):
+        self.account = {"accessToken": "token", "uid": "billing-test",
+                        "realm": "global", "domain": "www.workbuddy.ai"}
+
+    def test_readonly_query_retries_connection_abort_once(self):
+        class BrokenResponse:
+            status = 200
+
+            def read(self):
+                raise ConnectionAbortedError(10053, "connection aborted")
+
+            def close(self):
+                pass
+
+        class GoodResponse:
+            status = 200
+
+            def read(self):
+                return b'{"code":0,"data":{"balance":12}}'
+
+            def close(self):
+                pass
+
+        with mock.patch.object(wb, "upstream_request",
+                               side_effect=[BrokenResponse(), GoodResponse()]) as request, \
+             mock.patch.object(wb.time, "sleep"):
+            result = wb._billing_post(self.account, "/billing/meter/get-user-resource")
+        self.assertEqual(result, {"balance": 12})
+        self.assertEqual(request.call_count, 2)
+
+    def test_checkin_does_not_retry_connection_abort(self):
+        with mock.patch.object(wb, "upstream_request",
+                               side_effect=ConnectionAbortedError(10053, "connection aborted")) as request, \
+             self.assertRaises(ConnectionAbortedError):
+            wb._billing_post(self.account, "/v2/billing/meter/daily-checkin")
+        self.assertEqual(request.call_count, 1)
 
 
 class NumberTests(unittest.TestCase):

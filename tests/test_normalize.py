@@ -84,6 +84,11 @@ class NormalizeChatBodyTests(unittest.TestCase):
                                       "max_completion_tokens": 0})
         self.assertNotIn("max_tokens", out)
 
+    def test_zero_max_tokens_is_omitted(self):
+        out = wb.normalize_chat_body({"messages": [{"role": "user", "content": "hi"}],
+                                      "max_tokens": 0})
+        self.assertNotIn("max_tokens", out)
+
     def test_tool_choice_object_forms(self):
         base = {"messages": [{"role": "user", "content": "hi"}]}
         self.assertEqual(wb.normalize_chat_body(
