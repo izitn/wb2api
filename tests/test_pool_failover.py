@@ -135,6 +135,25 @@ class FailoverE2ETests(unittest.TestCase):
         self.assertEqual(len(set(used)), 2, "两次调用必须是不同账号")
         self.assertEqual(wb._pool_stats["switch"], 1)
 
+    def test_ambiguous_connection_error_does_not_fail_over(self):
+        h = make_handler()
+        err = ConnectionResetError("connection dropped after request write")
+        used = []
+
+        def fail_after_send(_payload, account):
+            used.append(wb.account_id(account))
+            raise err
+
+        with mock.patch.object(wb, "call_upstream", side_effect=fail_after_send), \
+             mock.patch.object(wb, "resolve_model", side_effect=lambda m, a: (m or "m1", None)), \
+             mock.patch.object(wb, "normalize_chat_body", side_effect=lambda b, a=None: b):
+            captured = {}
+            h._json = lambda code, obj, headers=None: captured.update(code=code, obj=obj)
+            h._error = lambda code, msg, etype="", **kw: captured.update(code=code, err=msg)
+            h._completion("/v1/chat/completions", {"model": "m1", "messages": MSGS})
+        self.assertEqual(len(used), 1)
+        self.assertEqual(captured.get("code"), 502)
+
     def test_bad_account_goes_into_cooldown(self):
         """换号后坏账号应进入冷却，下次直接跳过它。"""
         self._call(make_handler(), {"model": "m1", "messages": MSGS})
