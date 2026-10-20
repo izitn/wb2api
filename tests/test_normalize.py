@@ -21,6 +21,24 @@ import wb2api as wb  # noqa: E402  （必须在设置 WB_DATA_DIR 之后导入�
 
 
 class NormalizeChatBodyTests(unittest.TestCase):
+    def test_zero_token_limit_is_omitted_for_openai(self):
+        body = {"messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 0, "max_completion_tokens": 0}
+        wb.validate_request("/v1/chat/completions", body)
+        out = wb.normalize_chat_body(body)
+        self.assertNotIn("max_tokens", out)
+
+    def test_stream_numeric_values_are_normalized(self):
+        for value, expected in ((0, False), (1, True), ("0", False), ("1", True)):
+            body = {"messages": [{"role": "user", "content": "hi"}], "stream": value}
+            wb.validate_request("/v1/chat/completions", body)
+            self.assertIs(body["stream"], expected)
+
+    def test_responses_instructions_can_omit_input(self):
+        wb.validate_request("/v1/responses", {"instructions": "system only"})
+        body, _ = wb.responses_to_chat({"instructions": "system only"})
+        self.assertEqual(body["messages"][-1]["content"], "")
+
     def test_forces_stream_and_usage(self):
         out = wb.normalize_chat_body({"messages": [{"role": "user", "content": "hi"}]})
         self.assertTrue(out["stream"])

@@ -89,17 +89,33 @@ RETRY_FACTOR = 3.0
 RETRY_MAX_DELAY = 8.0     # 退避超过该值就不再重试，直接把错误交给客户端
 MODELS_TTL = 600
 MAX_BODY = 16 * 1024 * 1024
-MAX_INFLIGHT = int(os.environ.get("WB_MAX_INFLIGHT", "32"))   # 同时在途的对话请求上限
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        value = int(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
+
+
+MAX_INFLIGHT = _env_int("WB_MAX_INFLIGHT", 32, 1)   # 同时在途的对话请求上限
 CLIENT_TIMEOUT = 120      # 下游连接空闲超时（防慢速连接占线程）
 RESP_STORE_MAX = 256      # previous_response_id 内存会话条数
 RESP_STORE_TTL = 6 * 3600
 RESP_STORE_BYTES = 32 * 1024 * 1024  # 会话历史序列化后的总容量上限
 DEBUG = os.environ.get("WB_DEBUG", "") not in ("", "0")
 # 大请求体 gzip 后再发上游（实测上游支持；Codex 长上下文 133KB → 41KB）。失败会自动关闭并明文重发
-GZIP_MIN = int(os.environ.get("WB_GZIP_MIN", "16384"))      # 0 = 关闭
+GZIP_MIN = _env_int("WB_GZIP_MIN", 16384)      # 0 = 关闭
 _gzip_ok = GZIP_MIN > 0
+_gzip_disabled_bases: set[str] = set()
 _gzip_stats = {"requests": 0, "saved_bytes": 0}
 _gzip_stats_lock = threading.Lock()
+
+
+def _gzip_disabled(base: str) -> bool:
+    with _gzip_stats_lock:
+        return base in _gzip_disabled_bases
+
+
 KEEPALIVE_EVERY = 15      # 上游长时间思考期间，至少每 15 秒给客户端发一次 SSE 心跳
 # 上游强制首条消息为 system；客户端没带时补这一条（可用环境变量改）
 DEFAULT_SYSTEM = os.environ.get("WB_DEFAULT_SYSTEM", "You are a helpful assistant.")
@@ -122,6 +138,7 @@ USAGE_FILE = _data_path("WB_USAGE_FILE", "usage.jsonl")
 MODELS_CACHE_FILE = _data_path("WB_MODELS_CACHE_FILE", "models_cache.json")
 
 _lock = threading.RLock()
+_private_write_locks = tuple(threading.Lock() for _ in range(64))
 _models_lock = threading.Lock()
 _models_refreshing: set[str] = set()
 _auth: dict | None = None
@@ -842,15 +859,24 @@ def _write_private(path: str, text: str) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, path)
+    target = os.path.abspath(path)
+    lock = _private_write_locks[hash(target) % len(_private_write_locks)]
+    with lock:
+        tmp = "%s.%d.%d.tmp" % (target, os.getpid(), threading.get_ident())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp, target)
+        finally:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
 
 
 def _refresh_unlocked(a: dict) -> bool:
@@ -1216,11 +1242,19 @@ def validate_request(path: str, body: dict) -> None:
     """在调用上游之前拒绝会导致类型异常或明显无效的输入。"""
     if body.get("model") is not None and not isinstance(body["model"], str):
         raise ValueError("model 必须是字符串")
-    if "stream" in body and not isinstance(body["stream"], bool):
-        raise ValueError("stream 必须为布尔值 true 或 false")
-    for key in ("max_tokens", "max_completion_tokens", "max_output_tokens", "n"):
-        if key in body and (type(body[key]) is not int or body[key] <= 0):
-            raise ValueError("%s 必须是正整数" % key)
+    if "stream" in body:
+        stream = body["stream"]
+        if stream is True or (type(stream) is int and stream == 1) or stream in ("1", "true"):
+            body["stream"] = True
+        elif stream is False or (type(stream) is int and stream == 0) or stream in ("0", "false"):
+            body["stream"] = False
+        else:
+            raise ValueError("stream 必须是布尔值")
+    for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        if key in body and (type(body[key]) is not int or body[key] < 0):
+            raise ValueError("%s 必须是非负整数" % key)
+    if "n" in body and (type(body["n"]) is not int or body["n"] <= 0):
+        raise ValueError("n 必须是正整数")
     if "tools" in body and (not isinstance(body["tools"], list) or
                            any(not isinstance(t, dict) for t in body["tools"])):
         raise ValueError("tools 必须是工具对象组成的数组")
@@ -1230,19 +1264,19 @@ def validate_request(path: str, body: dict) -> None:
                 not isinstance(m, dict) or m.get("role") not in ("user", "assistant")
                 for m in messages):
             raise ValueError("messages 必须是非空数组，role 只能是 user 或 assistant")
-        if type(body.get("max_tokens")) is not int or body["max_tokens"] <= 0:
-            raise ValueError("Anthropic 请求必须提供正整数 max_tokens")
+        if type(body.get("max_tokens")) is not int or body["max_tokens"] < 0:
+            raise ValueError("Anthropic 请求必须提供非负整数 max_tokens")
         if "system" in body and not isinstance(body["system"], (str, list)):
             raise ValueError("system 必须是字符串或内容数组")
         _validate_anthropic_content(body.get("system", ""), "system")
         for message in messages:
             _validate_anthropic_content(message.get("content"), message["role"])
         for tool in body.get("tools", []):
+            if tool.get("type", "custom") != "custom":
+                raise ValueError("当前代理不支持 Anthropic 服务端工具")
             if (not isinstance(tool.get("name"), str) or not tool["name"].strip()
                     or not isinstance(tool.get("input_schema"), dict)):
                 raise ValueError("tools 中每个工具都需要 name 和 input_schema 对象")
-            if tool.get("type", "custom") != "custom":
-                raise ValueError("仅支持客户端自定义工具，暂不支持 Anthropic 服务端工具")
         choice = body.get("tool_choice")
         if choice is not None:
             if not isinstance(choice, dict) or choice.get("type") not in ("auto", "any", "tool", "none"):
@@ -1264,7 +1298,7 @@ def validate_request(path: str, body: dict) -> None:
         if prev is not None and not isinstance(prev, str):
             raise ValueError("previous_response_id 必须是字符串")
         inp = body.get("input")
-        if not isinstance(inp, (str, list)) and not (inp is None and prev):
+        if not isinstance(inp, (str, list)) and not (inp is None and (prev or body.get("instructions"))):
             raise ValueError("input 必须是字符串或消息数组")
         if isinstance(inp, list) and any(not isinstance(i, (str, dict)) for i in inp):
             raise ValueError("input 数组只能包含消息对象或字符串")
@@ -1288,6 +1322,8 @@ def normalize_chat_body(obj: dict, account: dict | None = None) -> dict:
     if alias is not None and "max_tokens" not in obj:
         if isinstance(alias, int) and alias > 0:
             obj["max_tokens"] = alias
+    if obj.get("max_tokens") == 0:
+        obj.pop("max_tokens", None)
 
     # 3) tool_choice 上游是 string 类型，对象形式会 400
     tc = obj.get("tool_choice")
@@ -1449,8 +1485,9 @@ def anthropic_to_chat(body: dict) -> dict:
             if calls:
                 message["tool_calls"] = calls
             messages.append(message)
-    out = {"model": body.get("model"), "messages": messages, "stream": True,
-           "max_tokens": body.get("max_tokens")}
+    out = {"model": body.get("model"), "messages": messages, "stream": True}
+    if isinstance(body.get("max_tokens"), int) and body["max_tokens"] > 0:
+        out["max_tokens"] = body["max_tokens"]
     for src, dst in (("temperature", "temperature"), ("top_p", "top_p"),
                      ("top_k", "top_k"), ("stop_sequences", "stop")):
         if src in body:
@@ -1759,6 +1796,7 @@ class UpstreamResponse:
         self.status = resp.status
         self.headers = resp.headers
         self.saw_done = False     # iter_chunks 见到 [DONE] 后置位：剩余字节很少，值得排空复用
+        self._eof = False
         self._closed = False
         self._gen = None          # 自解分块的生成器：排空必须继续用它（字节已在它的缓冲里）
 
@@ -1767,7 +1805,16 @@ class UpstreamResponse:
         if r.chunked and r.fp is not None and not r.isclosed():
             self._gen = self._iter_chunked()
             return self._gen
-        return iter(r)
+        return self._iter_standard()
+
+    def _iter_standard(self):
+        completed = False
+        try:
+            yield from self._r
+            completed = True
+        finally:
+            if completed and self._r.isclosed() and not self._r.will_close:
+                self._eof = True
 
     def _iter_chunked(self):
         """自己解分块编码并按行切分：http.client 的逐行读取对每个小块都要走几层
@@ -1813,22 +1860,32 @@ class UpstreamResponse:
             size = int(raw[:i].split(b";", 1)[0], 16)
             raw = raw[i + 2:]
             if size == 0:
-                # 终止块：跳过可选 trailer 直到空行，然后把响应标记为已读完（连接可复用）
-                while not (raw.startswith(b"\r\n") or b"\r\n\r\n" in raw):
+                # 只有完整读到 trailer 终止空行，才能把连接视为干净。
+                trailer_end = raw.find(b"\r\n\r\n")
+                trailers_complete = raw.startswith(b"\r\n") or trailer_end >= 0
+                while not trailers_complete:
                     more = read1(1024)
                     if not more:
                         break
                     raw += more
+                    trailer_end = raw.find(b"\r\n\r\n")
+                    trailers_complete = raw.startswith(b"\r\n") or trailer_end >= 0
+                if not trailers_complete:
+                    break
                 r.chunk_left = None
                 r.length = 0
                 r._close_conn()
+                self._eof = True
                 break
             body_left, crlf_left = size, 2
         if pending:
             yield pending
 
     def read(self) -> bytes:
-        return self._r.read()
+        data = self._r.read()
+        if self._r.isclosed() and not self._r.will_close:
+            self._eof = True
+        return data
 
     def close(self) -> None:
         if self._closed:
@@ -1844,9 +1901,11 @@ class UpstreamResponse:
                         pass
                 else:
                     r.read(65536)
+                    if r.isclosed():
+                        self._eof = True
         except Exception:  # noqa: BLE001
             pass
-        if r.isclosed() and not r.will_close:
+        if self._eof and r.isclosed() and not r.will_close:
             POOL.put(self._key, self._conn)
         else:
             try:
@@ -1861,21 +1920,19 @@ def upstream_request(method: str, url: str, headers: dict, body: bytes | None = 
     https = u.scheme == "https"
     port = u.port or (443 if https else 80)
     target = (u.path or "/") + ("?" + u.query if u.query else "")
-    for attempt in range(2):
-        key, conn, reused = POOL.get(u.scheme, u.hostname, port, timeout)
+    key, conn, _reused = POOL.get(u.scheme, u.hostname, port, timeout)
+    try:
         try:
-            conn.request(method, target, body=body, headers=headers)
-            r = conn.getresponse()
-        except (ConnectionError, http.client.BadStatusLine) as e:
-            conn.close()
-            if reused and attempt == 0:
-                continue        # 池里的连接已被对端关掉：换新连接重放一次（请求尚未被处理）
-            raise e
-        except BaseException:
-            conn.close()
+            conn.connect()
+        except (OSError, http.client.HTTPException) as e:
+            e.wb2api_retry_safe = True
             raise
-        return UpstreamResponse(key, conn, r)
-    raise ConnectionError("无法连接上游")  # pragma: no cover
+        conn.request(method, target, body=body, headers=headers)
+        r = conn.getresponse()
+    except BaseException:
+        conn.close()
+        raise
+    return UpstreamResponse(key, conn, r)
 
 
 def http_json(method: str, url: str, headers: dict, body: bytes | None = None, timeout: float = 30):
@@ -1909,6 +1966,28 @@ def _discard(resp) -> None:
         pass
 
 
+class _BufferedResponse:
+    def __init__(self, response, body: bytes):
+        self._response = response
+        self._body = body
+        self.status = response.status
+        self.headers = response.headers
+
+    def read(self, *_args):
+        body, self._body = self._body, b""
+        return body
+
+    def close(self):
+        self._response.close()
+
+
+def _looks_like_gzip_rejection(status: int, body: bytes) -> bool:
+    if status not in (400, 415):
+        return False
+    text = body[:4096].decode("utf-8", "replace").lower()
+    return "gzip" in text or "content-encoding" in text or "decompress" in text
+
+
 def _retry_delay(resp, attempt: int) -> float:
     ra = to_int((resp.headers.get("Retry-After") or "").strip()) if resp is not None else 0
     return float(ra) if ra > 0 else RETRY_BASE_DELAY * (RETRY_FACTOR ** (attempt - 1))
@@ -1933,22 +2012,25 @@ _chat_paths: dict[str, str] = {}  # 按上游域名记住路径，国内外请�
 
 
 def call_upstream(payload: dict, a: dict) -> UpstreamResponse:
-    """稳健调用：401 刷新重试一次、404/405 路径回落一次、429/5xx/连接错误退避重试。
-    所有重试都发生在给客户端写出任何字节之前，因此是安全的。"""
-    global _gzip_ok
+    """调用上游；只重试可确认尚未写出请求的连接错误与明确的 429。"""
     base = upstream_base(a)
     chat_path = _chat_paths.get(base, CHAT_PATH)
     # ensure_ascii=True：代码/英文为主的上下文序列化快 3~4 倍；体积膨胀的部分 gzip 会吃掉
     data = json.dumps(payload, separators=(",", ":")).encode("ascii")
-    gz = _gzip(data) if _gzip_ok and len(data) >= GZIP_MIN else None
+    gz = _gzip(data) if _gzip_ok and not _gzip_disabled(base) and len(data) >= GZIP_MIN else None
     refreshed = tried_alt = False
     attempt = 0
+    request_id = _uuid7().hex
     while True:
         token = a.get("accessToken")
         url = base + chat_path
         h = chat_headers(a)
+        h["X-Request-ID"] = request_id
+        h["X-Conversation-Message-ID"] = request_id
+        h["X-Conversation-Request-ID"] = request_id
+        h["X-Root-Request-ID"] = request_id
         body = data
-        if gz is not None and _gzip_ok:
+        if gz is not None and _gzip_ok and not _gzip_disabled(base):
             h["Content-Encoding"] = "gzip"
             body = gz
             with _gzip_stats_lock:
@@ -1966,7 +2048,7 @@ def call_upstream(payload: dict, a: dict) -> UpstreamResponse:
         try:
             resp = upstream_request("POST", url, h, body)
         except (OSError, http.client.HTTPException) as e:
-            if attempt < UPSTREAM_RETRIES and not isinstance(e, TimeoutError):
+            if getattr(e, "wb2api_retry_safe", False) and attempt < UPSTREAM_RETRIES:
                 attempt += 1
                 log("上游连接失败（%s），第 %d 次重试" % (e, attempt))
                 time.sleep(_retry_delay(None, attempt))
@@ -1975,11 +2057,15 @@ def call_upstream(payload: dict, a: dict) -> UpstreamResponse:
         st = resp.status
         if DEBUG:
             log("← %s %s" % (st, resp.headers.get("Content-Type")))
-        if body is gz and st in (400, 411, 413, 415, 422):
-            _discard(resp)               # 上游（或中间代理）不认 gzip：本进程内永久关闭，明文重发
-            _gzip_ok = False
-            log("上游不接受 gzip 请求体（HTTP %s），已改为明文发送" % st)
-            continue
+        if body is gz and st in (400, 415):
+            raw = resp.read()
+            if _looks_like_gzip_rejection(st, raw):
+                resp.close()
+                with _gzip_stats_lock:
+                    _gzip_disabled_bases.add(base)
+                log("上游 %s 拒绝 gzip 请求体，已按该上游关闭压缩" % st)
+                continue
+            resp = _BufferedResponse(resp, raw)
         if st == 401 and not refreshed:
             refreshed = True
             _discard(resp)
@@ -1993,7 +2079,7 @@ def call_upstream(payload: dict, a: dict) -> UpstreamResponse:
             _chat_paths[base] = chat_path
             log("对话接口路径回退 → %s" % chat_path)
             continue
-        if st in RETRY_STATUS and attempt < UPSTREAM_RETRIES:
+        if st == 429 and attempt < UPSTREAM_RETRIES:
             delay = _retry_delay(resp, attempt + 1)
             if delay <= RETRY_MAX_DELAY:
                 attempt += 1
@@ -2579,7 +2665,7 @@ def responses_to_chat(body: dict, owner: str = "") -> tuple[dict, dict]:
     for k in ("temperature", "top_p", "parallel_tool_calls", "stop", "user", "seed"):
         if k in body:
             chat[k] = body[k]
-    if isinstance(body.get("max_output_tokens"), int):
+    if isinstance(body.get("max_output_tokens"), int) and body["max_output_tokens"] > 0:
         chat["max_tokens"] = body["max_output_tokens"]
     tools = _responses_tools(body.get("tools"), ctx)
     if tools:
@@ -2742,16 +2828,15 @@ def chat_to_response(acc: ChatAccumulator, model: str, rid: str, ctx: dict) -> d
 def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, ping=None):
     """把上游 chat SSE **实时**转成 Responses 事件流（逐 token 转发，不缓冲）。
 
-    状态机：reasoning / message 同一时刻最多开一个（切换即关闭前一个）；
-    工具调用按上游 index 各自开启，名字到达后才发 output_item.added；
-    模型从工具转回文本时先收尾全部工具，保证 output_item.done 按 output_index 递增。
+    状态机：reasoning / message 同一时刻最多开一个；工具调用按上游 index
+    各自开启，名字到达后才发 output_item.added。工具参数可以和文本交错，
+    每个 item 只在确认流正常结束后发自己的终结事件。
     """
     created = int(time.time())
     seq = [0]
     output: list = []
     cur: dict | None = None
     tools: dict[int, dict] = {}
-
     def ev(name, payload):
         payload = dict(payload)
         payload["type"] = name
@@ -2788,19 +2873,22 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
         if st["kind"] == "reasoning":
             part = {"type": "summary_text", "text": text}
             item["summary"] = [part]
-            yield ev("response.reasoning_summary_text.done", {
-                "item_id": item["id"], "output_index": idx, "summary_index": 0, "text": text})
-            yield ev("response.reasoning_summary_part.done", {
-                "item_id": item["id"], "output_index": idx, "summary_index": 0, "part": part})
+            terminal = [("response.reasoning_summary_text.done", {
+                "item_id": item["id"], "output_index": idx, "summary_index": 0, "text": text}),
+                ("response.reasoning_summary_part.done", {
+                "item_id": item["id"], "output_index": idx, "summary_index": 0, "part": part})]
         else:
             part = {"type": "output_text", "text": text, "annotations": []}
             item["content"] = [part]
-            item["status"] = "completed"
-            yield ev("response.output_text.done", {
-                "item_id": item["id"], "output_index": idx, "content_index": 0, "text": text})
-            yield ev("response.content_part.done", {
-                "item_id": item["id"], "output_index": idx, "content_index": 0, "part": part})
-        yield ev("response.output_item.done", {"output_index": idx, "item": item})
+            terminal = [("response.output_text.done", {
+                "item_id": item["id"], "output_index": idx, "content_index": 0, "text": text}),
+                ("response.content_part.done", {
+                "item_id": item["id"], "output_index": idx, "content_index": 0, "part": part})]
+        terminal.append(("response.output_item.done", {"output_index": idx, "item": item}))
+        for name, payload in terminal:
+            if name == "response.output_item.done" and payload["item"].get("type") == "message":
+                payload["item"]["status"] = "completed"
+            yield ev(name, payload)
 
     def text_delta(kind, text):
         nonlocal cur
@@ -2812,10 +2900,12 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
         cur["buf"].append(text)
         item = cur["item"]
         if kind == "reasoning":
+            item["summary"] = [{"type": "summary_text", "text": "".join(cur["buf"])}]
             yield ev("response.reasoning_summary_text.delta", {
                 "item_id": item["id"], "output_index": cur["idx"], "summary_index": 0,
                 "delta": text})
         else:
+            item["content"] = [{"type": "output_text", "text": "".join(cur["buf"]), "annotations": []}]
             yield ev("response.output_text.delta", {
                 "item_id": item["id"], "output_index": cur["idx"], "content_index": 0,
                 "delta": text})
@@ -2850,13 +2940,16 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
             args = slot["function"]["arguments"]
             final = _call_item(slot["id"], slot["function"]["name"], args, ctx, item["id"])
             output[t["idx"]] = final
+            terminal = []
             if final["type"] == "function_call":
-                yield ev("response.function_call_arguments.done", {
-                    "item_id": final["id"], "output_index": t["idx"], "arguments": args})
+                terminal.append(("response.function_call_arguments.done", {
+                    "item_id": final["id"], "output_index": t["idx"], "arguments": args}))
             elif final["type"] == "custom_tool_call":
-                yield ev("response.custom_tool_call_input.done", {
-                    "item_id": final["id"], "output_index": t["idx"], "input": final["input"]})
-            yield ev("response.output_item.done", {"output_index": t["idx"], "item": final})
+                terminal.append(("response.custom_tool_call_input.done", {
+                    "item_id": final["id"], "output_index": t["idx"], "input": final["input"]}))
+            terminal.append(("response.output_item.done", {"output_index": t["idx"], "item": final}))
+            for name, payload in terminal:
+                yield ev(name, payload)
 
     yield ev("response.created", {"response": snapshot("in_progress", [])})
     yield ev("response.in_progress", {"response": snapshot("in_progress", [])})
@@ -2872,14 +2965,9 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
                 if e[0] in ("reasoning", "content"):
                     if e[0] == "reasoning" and HIDE_REASONING:
                         continue
-                    if any(t["open"] for t in tools.values()):
-                        yield from close_tools()
                     yield from text_delta("reasoning" if e[0] == "reasoning" else "message", e[2])
                     continue
                 _, _, ti, slot, args = e
-                if cur is not None:      # 文本 / 推理先收尾，再开工具 item
-                    yield from close_item(cur)
-                    cur = None
                 t = tools.get(ti)
                 if t is None:
                     t = tools[ti] = {"slot": slot, "idx": None, "item": None, "open": False}
@@ -2888,6 +2976,7 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
                         yield from open_tool(t)      # 会顺带补发已缓冲的参数
                     continue
                 if args and t["open"] and t["item"]["type"] == "function_call":
+                    t["item"]["arguments"] = t["slot"]["function"]["arguments"]
                     yield ev("response.function_call_arguments.delta", {
                         "item_id": t["item"]["id"], "output_index": t["idx"], "delta": args})
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -2901,10 +2990,6 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
         yield ev("response.failed", {"response": failed})
         return
 
-    if cur is not None:
-        yield from close_item(cur)
-    yield from close_tools()
-
     finish = acc.finish(0)
     if finish is None:
         # 上游在给出 finish_reason 之前就结束了：文本/工具参数可能是截断的，
@@ -2917,6 +3002,9 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
         yield ev("response.failed", {"response": failed})
         return
 
+    if cur is not None:
+        yield from close_item(cur)
+    yield from close_tools()
     status, details = _finish_status(finish)
     final = snapshot(status, output)
     final["output_text"] = "".join(
@@ -3235,11 +3323,9 @@ def clear_models_cache(a: dict | None = None) -> None:
 
 def _save_models_disk() -> None:
     try:
-        tmp = MODELS_CACHE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"owner": _models_cache["owner"], "at": _models_cache["at"],
-                       "data": _models_cache["data"]}, f, ensure_ascii=False)
-        os.replace(tmp, MODELS_CACHE_FILE)
+        payload = {"owner": _models_cache["owner"], "at": _models_cache["at"],
+                   "data": _models_cache["data"]}
+        _write_private(MODELS_CACHE_FILE, json.dumps(payload, ensure_ascii=False))
     except Exception as e:  # noqa: BLE001
         log("模型目录缓存落盘失败：%s" % e)
 
@@ -3849,10 +3935,13 @@ def health() -> dict:
     with _gzip_stats_lock:
         gzip_requests = _gzip_stats["requests"]
         gzip_saved = _gzip_stats["saved_bytes"]
+        gzip_enabled = _gzip_ok and upstream_base(a) not in _gzip_disabled_bases
+        gzip_disabled = sorted(_gzip_disabled_bases)
     out = {"status": "ok", "upstream": upstream_base(a), "loggedIn": bool(a),
            "uptime": int(time.time() - _started_at), "inflight": inflight,
            "upstreamConns": {"created": POOL.created, "reused": POOL.reused},
-           "gzip": {"enabled": _gzip_ok, "requests": gzip_requests,
+           "gzip": {"enabled": gzip_enabled,
+                    "disabledBases": gzip_disabled, "requests": gzip_requests,
                     "savedKB": gzip_saved // 1024}}
     if exp:
         out["tokenExpiresIn"] = int(exp - time.time())
@@ -3944,6 +4033,7 @@ class Handler(BaseHTTPRequestHandler):
         超限时不读，标记关闭连接（否则残留字节会污染 keep-alive 上的下一个请求）。"""
         self._body_err = None
         if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            self._drain_chunked()
             self.close_connection = True
             self._body_err = (411, "不支持分块请求正文，请提供 Content-Length")
             return None
@@ -3982,6 +4072,41 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             return None
         return obj if isinstance(obj, dict) else None
+
+    def _drain_chunked(self, max_bytes: int = 1024 * 1024, timeout: float = 0.5) -> None:
+        """尽力排空被拒绝的 chunked 正文，减少客户端收不到 411 的概率。"""
+        connection = getattr(self, "connection", None)
+        if connection is None:
+            return
+        old_timeout = connection.gettimeout()
+        total = 0
+        try:
+            connection.settimeout(timeout)
+            while total <= max_bytes:
+                line = self.rfile.readline(8192)
+                if not line or not line.endswith(b"\n"):
+                    return
+                try:
+                    size = int(line.split(b";", 1)[0].strip(), 16)
+                except ValueError:
+                    return
+                if size < 0 or total + size > max_bytes:
+                    return
+                total += size
+                if size == 0:
+                    while True:
+                        trailer = self.rfile.readline(8192)
+                        if not trailer or trailer in (b"\r\n", b"\n"):
+                            return
+                if len(self.rfile.read(size + 2)) != size + 2:
+                    return
+        except (OSError, ValueError):
+            return
+        finally:
+            try:
+                connection.settimeout(old_timeout)
+            except OSError:
+                pass
 
     def log_message(self, fmt, *args):  # 静音默认访问日志，只留我们自己的
         return
@@ -4361,7 +4486,7 @@ class Handler(BaseHTTPRequestHandler):
             code = 404 if err.startswith("模型 '") else 400
             return self._error(code, err)
         body["model"] = model
-        want_stream = bool(body.get("stream"))
+        want_stream = body.get("stream") is True
         is_resp = path == "/v1/responses"
         is_anthropic = path == "/v1/messages"
         ctx = None
@@ -4809,7 +4934,7 @@ def main() -> None:
     ap._optionals.title = "可选参数"
     ap.add_argument("-h", "--help", action="help", help="显示帮助并退出")
     ap.add_argument("--host", default=os.environ.get("WB_HOST", "127.0.0.1"), help="监听地址，默认 127.0.0.1")
-    ap.add_argument("--port", type=int, default=int(os.environ.get("WB_PORT", "8787")), help="监听端口，默认 8787")
+    ap.add_argument("--port", type=int, default=_env_int("WB_PORT", 8787, 1), help="监听端口，默认 8787")
     ap.add_argument("--data-dir", default="",
                     help="状态文件目录（auth.json / api_key.txt / selection.json 等），默认脚本所在目录")
     ap.add_argument("--auth", default="", help="凭证文件路径（默认 <data-dir>/auth.json）")

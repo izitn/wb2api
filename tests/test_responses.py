@@ -56,6 +56,7 @@ class ResponsesStreamTests(unittest.TestCase):
         body, acc = self.run_stream(text_chunks(finish=None))
         self.assertIn("response.failed", body)
         self.assertNotIn("response.completed", body)
+        self.assertNotIn("response.output_item.done", body)
         self.assertIn("finish_reason", acc.error)
 
     def test_normal_stream_completes(self):
@@ -67,6 +68,37 @@ class ResponsesStreamTests(unittest.TestCase):
         body, _ = self.run_stream(text_chunks(finish="length"))
         self.assertIn("response.incomplete", body)
         self.assertIn("max_output_tokens", body)
+
+    def test_text_interleaved_with_tool_arguments_preserves_full_item(self):
+        chunks = [
+            sse({"choices": [{"index": 0, "delta": {"content": "before"}}]}),
+            sse({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": {"name": "lookup", "arguments": '{"q":'}}]}}]}),
+            sse({"choices": [{"index": 0, "delta": {"content": "after"}}]}),
+            sse({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "function": {"arguments": '"x"}'}}]},
+                "finish_reason": "tool_calls"}]}),
+            DONE,
+        ]
+        body, _ = self.run_stream(chunks)
+        events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+        dones = [e for e in events if e["type"] == "response.output_item.done"]
+        self.assertEqual([e["output_index"] for e in dones], [0, 1])
+        self.assertEqual(dones[0]["item"]["content"][0]["text"], "beforeafter")
+        self.assertEqual(json.loads(dones[1]["item"]["arguments"]), {"q": "x"})
+        seq = [e["sequence_number"] for e in events]
+        self.assertEqual(seq, list(range(len(seq))))
+
+    def test_midstream_error_does_not_complete_open_item(self):
+        def chunks():
+            yield sse({"choices": [{"index": 0, "delta": {"content": "partial"}}]})
+            raise RuntimeError("socket closed")
+
+        body, acc = self.run_stream(chunks())
+        self.assertIn("response.failed", body)
+        self.assertNotIn("response.output_item.done", body)
+        self.assertIn("响应流中断", acc.error)
 
 
 class ResponsesUsageTests(unittest.TestCase):
