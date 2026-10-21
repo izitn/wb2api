@@ -199,6 +199,50 @@ Anthropic SDK 接入时，将 `ANTHROPIC_BASE_URL` 设置为 `http://127.0.0.1:8
 
 Responses 的 `previous_response_id` 历史保存在内存中，最多 256 条、保留 6 小时，序列化历史总容量最多 32 MiB（不是进程总内存上限）。超过条数或容量时淘汰最早存入的历史，单条超过容量上限则不缓存。访问缓存及后台每 30 秒的维护会清理过期记录。重启、过期或淘汰后，相应 ID 无法续接，需要重新提供上下文。
 
+## Claude Code 使用说明
+
+### 兼容性注意
+
+由于 WorkBuddy 的渠道校验策略，**Claude Code 使用 Anthropic Messages 接口（`/v1/messages`）可能遇到 `code=11128` 错误**。这是 WorkBuddy 在检测到非官方客户端身份特征后主动拒绝请求，与 wb2api 的格式转换无关。
+
+### 推荐方案：使用 OpenAI 接口
+
+**在 Claude Code 配置中使用 `/v1/chat/completions` 接口**（`~/.claude/settings.json`）：
+
+```json
+{
+  "openai": {
+    "baseURL": "http://127.0.0.1:8787/v1",
+    "apiKey": "wb-your-api-key",
+    "model": "claude-sonnet-4-20250514"
+  }
+}
+```
+
+或者配置为 Anthropic 提供商但使用 OpenAI 格式：
+
+```json
+{
+  "anthropic": {
+    "apiProvider": "openai",
+    "openai": {
+      "baseURL": "http://127.0.0.1:8787/v1",
+      "apiKey": "wb-your-api-key",
+      "model": "claude-sonnet-4-20250514"
+    }
+  }
+}
+```
+
+**要点**：
+- 使用 `/v1/chat/completions` 接口，wb2api 提供完整支持
+- `model` 填写控制台中已启用的实际模型 ID
+- `apiKey` 从网页控制台的"接入配置"中获取
+
+### 技术背景
+
+WorkBuddy 的渠道校验不仅检查 HTTP 请求头，还会分析 system prompt 内容。Claude Code 的默认 system prompt 包含身份标识（如 "You are Claude Code, Anthropic's official CLI"），会被检测为非官方客户端而拒绝。使用 OpenAI 接口可以避开这一检测机制。
+
 ## 国际版出站身份（渠道校验）
 
 上游会校验请求是否"像官方客户端发出的"，不通过时返回 `400 / code 11128`（`request illegal`，`displayTips` 提示"这次调用没通过渠道校验，可能不是官方客户端发出的"）。2026-10-19 起该校验对国际版明显收紧，只补 `system` 首条消息已不足以通过。
@@ -240,6 +284,7 @@ Python 测试覆盖 Anthropic 转换、OpenAI 请求体归一、HTTP 路由与�
 
 这些是当前版本有意保留的行为，不是缺陷：
 
+- **Claude Code 与 Anthropic Messages**：由于 WorkBuddy 的渠道校验策略，Claude Code 使用 `/v1/messages` 接口可能遇到 `code=11128` 错误。推荐使用 `/v1/chat/completions` 接口（OpenAI 格式），wb2api 对该接口提供完整支持。详见"Claude Code 使用说明"章节。
 - **Responses 端点**：不支持的内容块（`input_file`、`input_audio`、`file_id` 图片、`item_reference`）会被忽略而不是报错；模型拒答（refusal）不会转成 `refusal` 内容块；`finish_reason=length` 时 `response.status` 为 `incomplete`，但 `item.status` 仍是 `completed`。
 - **流式与非流式差异**：`model` 字段来源不同（非流式优先用上游回显，流式用请求值），`parallel_tool_calls` 只在非流式响应里出现。
 - **默认模型回退**：只有当模型目录完整（三路 `/v3/config` 全部成功）且该模型未被勾选时，未知模型名才会回退到默认模型。目录残缺时宁可让上游返回错误，也不静默换模型。
