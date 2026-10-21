@@ -83,6 +83,25 @@ python wb2api.py
 `WB_POOL_SOFT_MAX`、`WB_POOL_HARD_COOLDOWN`、`WB_POOL_FAIL_THRESHOLD`、`WB_POOL_BREAKER`、
 `WB_POOL_STICKY_TTL`、`WB_POOL_MAX_SWITCH`。
 
+### 其他可配置参数
+
+代理层面的性能与容量也支持通过环境变量调整：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `WB_MAX_BODY` | `16777216` (16MB) | 请求体大小上限（字节），最小 1MB，最大 256MB |
+| `WB_CLIENT_TIMEOUT` | `120` | 下游连接空闲超时（秒），范围 30-3600 |
+| `WB_DRAIN_BODY_MAX` | `1048576` (1MB) | chunked 请求体排空上限（字节） |
+| `WB_POOL_IDLE_TTL` | `40` | 连接池空闲超时（秒），范围 10-120 |
+| `WB_GZIP_MIN` | `16384` (16KB) | gzip 压缩阈值（字节），`0` 禁用压缩 |
+| `WB_GZIP_DISABLE_TTL` | `1800` (30分钟) | gzip 被拒后禁用时长（秒），`0` 永久禁用 |
+
+**常见场景**：
+
+- **长上下文对话遇到 413 错误**：提高 `WB_MAX_BODY` 到 `67108864`（64MB）或更高
+- **网络不稳定**：延长 `WB_CLIENT_TIMEOUT` 到 `180` 或 `300`
+- **高并发场景**：延长 `WB_POOL_IDLE_TTL` 到 `60`，增加连接复用率
+
 ## 网页控制台
 
 控制台按用途分成三个页面，顶部始终展示当前账户和余额。手机上，wb2api 自启开关位于顶部导航下方。

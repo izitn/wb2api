@@ -1,5 +1,39 @@
 # wb2api-lite 安全修复记录
 
+## 2026-10-21 配置增强与错误修复
+
+### 配置可调性改进
+- **MAX_BODY 可配置**：新增 `WB_MAX_BODY` 环境变量，默认 16MB，最小 1MB，最大 256MB
+  - 解决大上下文请求（长对话、大量 context）触发 413 错误的问题
+- **CLIENT_TIMEOUT 可配置**：新增 `WB_CLIENT_TIMEOUT` 环境变量，默认 120 秒，范围 30-3600 秒
+- **DRAIN_BODY_MAX 可配置**：新增 `WB_DRAIN_BODY_MAX` 环境变量，控制 chunked 请求体排空上限
+- **IDLE_TTL 可配置**：新增 `WB_POOL_IDLE_TTL` 环境变量，控制连接池空闲超时，默认 40 秒，范围 10-120 秒
+
+### gzip 压缩策略改进
+- **gzip 禁用 TTL**：新增 `WB_GZIP_DISABLE_TTL` 环境变量，默认 1800 秒（30 分钟）
+  - 原行为：一旦被拒绝，永久禁用该上游的 gzip
+  - 新行为：禁用有过期时间，过期后自动重新启用
+  - 设置为 0 可恢复旧的永久禁用行为
+- gzip 被拒绝时会记录禁用时长（永久或秒数）
+
+### 代码质量改进
+- **修复重复定义**：删除了重复的 `_drain_chunked` 函数定义（第一个版本），保留更完善的版本
+- **异常处理精确化**：JSON 解析异常从 `except Exception` 改为 `except (json.JSONDecodeError, UnicodeDecodeError)`
+  - 避免掩盖非 JSON 解析相关的异常
+
+### 环境变量参考
+```bash
+# 请求体与连接
+WB_MAX_BODY=16777216           # 请求体大小上限（字节），默认 16MB
+WB_CLIENT_TIMEOUT=120          # 下游连接空闲超时（秒）
+WB_DRAIN_BODY_MAX=1048576      # chunked 排空上限（字节）
+WB_POOL_IDLE_TTL=40            # 连接池空闲超时（秒）
+
+# gzip 压缩
+WB_GZIP_MIN=16384              # gzip 最小阈值（字节），0 = 禁用
+WB_GZIP_DISABLE_TTL=1800       # gzip 被拒后禁用时长（秒），0 = 永久
+```
+
 ## 2026-10-21 管理界面与积分查询体验
 
 - 积分只读查询遇到连接中止时最多重试一次；签到提交不走该重试，避免重复写操作。
