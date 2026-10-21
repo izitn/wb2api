@@ -93,7 +93,7 @@ MODELS_TTL = 600
 # 只在国内版/国际版各自池内换号，绝不跨池：两个区域的 token 与上游域都不同，
 # 混池会把请求发到错误的上游。
 POOL_ENABLED = os.environ.get("WB_POOL", "1") not in ("", "0", "false", "False")
-MAX_BODY = 16 * 1024 * 1024
+
 def _env_int(name: str, default: int, minimum: int = 0,
              maximum: int | None = None) -> int:
     try:
@@ -124,24 +124,40 @@ POOL_STICKY_TTL = _env_float("WB_POOL_STICKY_TTL", 1800)
 POOL_STICKY_MAX = _env_int("WB_POOL_STICKY_MAX", 4096, 1)
 POOL_MAX_SWITCH = _env_int("WB_POOL_MAX_SWITCH", 3)
 
-
+# --- 请求体与连接 ---
+MAX_BODY = _env_int("WB_MAX_BODY", 16 * 1024 * 1024, 1024 * 1024, 256 * 1024 * 1024)  # 最小 1MB，最大 256MB
 MAX_INFLIGHT = _env_int("WB_MAX_INFLIGHT", 32, 1)   # 同时在途的对话请求上限
-CLIENT_TIMEOUT = 120      # 下游连接空闲超时（防慢速连接占线程）
+CLIENT_TIMEOUT = _env_int("WB_CLIENT_TIMEOUT", 120, 30, 3600)  # 下游连接空闲超时（防慢速连接占线程）
+DRAIN_BODY_MAX = _env_int("WB_DRAIN_BODY_MAX", 1024 * 1024, 8192, MAX_BODY)  # chunked 排空上限
 RESP_STORE_MAX = 256      # previous_response_id 内存会话条数
 RESP_STORE_TTL = 6 * 3600
 RESP_STORE_BYTES = 32 * 1024 * 1024  # 会话历史序列化后的总容量上限
 DEBUG = os.environ.get("WB_DEBUG", "") not in ("", "0")
 # 大请求体 gzip 后再发上游（实测上游支持；Codex 长上下文 133KB → 41KB）。失败会自动关闭并明文重发
 GZIP_MIN = _env_int("WB_GZIP_MIN", 16384)      # 0 = 关闭
+GZIP_DISABLE_TTL = _env_int("WB_GZIP_DISABLE_TTL", 1800, 0)  # gzip 被拒绝后禁用的时长（秒），0 = 永久
 _gzip_ok = GZIP_MIN > 0
-_gzip_disabled_bases: set[str] = set()
+_gzip_disabled_bases: dict[str, float] = {}  # base → 禁用到期时间戳
 _gzip_stats = {"requests": 0, "saved_bytes": 0}
 _gzip_stats_lock = threading.Lock()
 
 
 def _gzip_disabled(base: str) -> bool:
+    if GZIP_DISABLE_TTL == 0:
+        # 永久禁用模式，兼容旧行为
+        with _gzip_stats_lock:
+            return base in _gzip_disabled_bases
+    # TTL 模式
     with _gzip_stats_lock:
-        return base in _gzip_disabled_bases
+        expires_at = _gzip_disabled_bases.get(base, 0)
+        if expires_at == 0:
+            return False
+        now = time.time()
+        if now >= expires_at:
+            # 过期，重新启用
+            _gzip_disabled_bases.pop(base, None)
+            return False
+        return True
 
 
 KEEPALIVE_EVERY = 15      # 上游长时间思考期间，至少每 15 秒给客户端发一次 SSE 心跳
@@ -2101,7 +2117,7 @@ class _Pool:
     连接只在响应被完整读完后才归还；中途放弃的连接直接关闭，绝不复用脏连接。
     """
     MAX_IDLE = min(MAX_INFLIGHT, 16)   # 与并发上限对齐：并发突发后连接不被白白关掉重建
-    IDLE_TTL = 40     # 秒；实测上游空闲 45~60 秒断开，留余量，少拿到已被对端关掉的连接
+    IDLE_TTL = _env_int("WB_POOL_IDLE_TTL", 40, 10, 120)  # 秒；实测上游空闲 45~60 秒断开，留余量
 
     def __init__(self):
         self._idle: dict = {}
@@ -2514,8 +2530,12 @@ def call_upstream(payload: dict, a: dict) -> UpstreamResponse:
             if _looks_like_gzip_rejection(st, raw):
                 resp.close()
                 with _gzip_stats_lock:
-                    _gzip_disabled_bases.add(base)
-                log("上游 %s 拒绝 gzip 请求体，已按该上游关闭压缩" % st)
+                    if GZIP_DISABLE_TTL == 0:
+                        _gzip_disabled_bases[base] = 0  # 永久禁用
+                    else:
+                        _gzip_disabled_bases[base] = time.time() + GZIP_DISABLE_TTL
+                log("上游 %s 拒绝 gzip 请求体，已按该上游禁用压缩 %s" % (
+                    st, "永久" if GZIP_DISABLE_TTL == 0 else f"{GZIP_DISABLE_TTL}秒"))
                 continue
             resp = _BufferedResponse(resp, raw)
         if st == 401 and not refreshed:
@@ -4542,51 +4562,18 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         try:
             obj = json.loads(raw.decode("utf-8"))
-        except Exception:  # noqa: BLE001
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return None
         return obj if isinstance(obj, dict) else None
-
-    def _drain_chunked(self, max_bytes: int = 1024 * 1024, timeout: float = 0.5) -> None:
-        """尽力排空被拒绝的 chunked 正文，减少客户端收不到 411 的概率。"""
-        connection = getattr(self, "connection", None)
-        if connection is None:
-            return
-        old_timeout = connection.gettimeout()
-        total = 0
-        try:
-            connection.settimeout(timeout)
-            while total <= max_bytes:
-                line = self.rfile.readline(8192)
-                if not line or not line.endswith(b"\n"):
-                    return
-                try:
-                    size = int(line.split(b";", 1)[0].strip(), 16)
-                except ValueError:
-                    return
-                if size < 0 or total + size > max_bytes:
-                    return
-                total += size
-                if size == 0:
-                    while True:
-                        trailer = self.rfile.readline(8192)
-                        if not trailer or trailer in (b"\r\n", b"\n"):
-                            return
-                if len(self.rfile.read(size + 2)) != size + 2:
-                    return
-        except (OSError, ValueError):
-            return
-        finally:
-            try:
-                connection.settimeout(old_timeout)
-            except OSError:
-                pass
 
     def log_message(self, fmt, *args):  # 静音默认访问日志，只留我们自己的
         return
 
-    def _drain_chunked(self, max_bytes: int = 1024 * 1024,
+    def _drain_chunked(self, max_bytes: int | None = None,
                        timeout: float = 0.5) -> None:
         """有界尝试排空被拒绝的 chunked 正文，超限或超时即停止并关闭连接。"""
+        if max_bytes is None:
+            max_bytes = DRAIN_BODY_MAX
         connection = getattr(self, "connection", None)
         if connection is None:
             return
