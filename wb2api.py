@@ -33,6 +33,7 @@ import http.client
 import json
 import math
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -193,6 +194,8 @@ _models_cache: dict = {"at": 0.0, "data": None, "owner": None}
 _catalogs: dict[str, dict] = {}
 _selection: list[str] = []          # 用户勾选的模型子集；空 = 不过滤
 _account_selections: dict[str, list[str]] = {}
+_pool_selections: dict[str, list[str]] = {}  # 池级别模型配置：{"cn": [...], "global": [...]}
+_pool_aliases: dict[str, dict[str, str]] = {}  # 池级别别名：{"cn": {...}, "global": {...}}
 _selection_owner = ""
 _selection_scoped = False
 _aliases: dict[str, str] = {}       # 模型别名：客户端写死的名字 → 实际模型
@@ -2582,6 +2585,37 @@ def is_sse(resp) -> bool:
     return not ct or "event-stream" in ct.lower()
 
 
+def _sanitize_for_log(text: str, max_len: int = 200) -> str:
+    """清洗文本用于日志记录，防止敏感信息泄露和日志注入。"""
+    if not text or not isinstance(text, str):
+        return ""
+
+    # 1. 控制字符压平（防止日志注入）
+    text = text.replace('\r', ' ').replace('\n', ' ').replace('\t', ' ')
+
+    # 2. 脱敏敏感字段模式
+    import re
+    patterns = [
+        # 凭证类
+        (r'["\']?accessToken["\']?\s*:\s*["\'][^"\']+["\']', '"accessToken":"[REDACTED]"'),
+        (r'["\']?deviceToken["\']?\s*:\s*["\'][^"\']+["\']', '"deviceToken":"[REDACTED]"'),
+        (r'["\']?refreshToken["\']?\s*:\s*["\'][^"\']+["\']', '"refreshToken":"[REDACTED]"'),
+        (r'sk-[a-f0-9]{32}', 'sk-[REDACTED]'),
+        (r'Bearer\s+[A-Za-z0-9\-._~+/]+=*', 'Bearer [REDACTED]'),
+        # 用户输入回显（messages 数组内容）
+        (r'"messages"\s*:\s*\[[^\]]{100,}\]', '"messages":[REDACTED]'),
+        (r'"content"\s*:\s*"[^"]{80,}"', '"content":"[TRUNCATED]"'),
+    ]
+    for pattern, replacement in patterns:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE | re.DOTALL)
+
+    # 3. 长度限制
+    if len(text) > max_len:
+        text = text[:max_len] + '...[TRUNCATED]'
+
+    return text
+
+
 def sse_error(obj) -> str | None:
     """识别 SSE 帧里内嵌的错误：{"error":{...}} 或 {"code":非0,"msg":...}。"""
     if not isinstance(obj, dict):
@@ -2598,6 +2632,10 @@ def sse_error(obj) -> str | None:
 
 
 def read_error(resp) -> tuple[int, str]:
+    """读取上游错误响应，返回 (状态码, 清洗后的错误摘要)。
+
+    错误摘要用于返回客户端和记录日志，已脱敏敏感信息并限制长度。
+    """
     status = getattr(resp, "status", 502) or 502
     try:
         raw = resp.read().decode("utf-8", "replace")
@@ -2616,6 +2654,10 @@ def read_error(resp) -> tuple[int, str]:
             msg = "%s (code=%s)" % (msg, code)
     except Exception:  # noqa: BLE001
         msg = raw or "上游返回错误"
+
+    # 清洗错误信息（脱敏 + 长度限制）
+    msg = _sanitize_for_log(str(msg), max_len=300)
+
     if status < 400:      # 200 + JSON 业务错误
         status = 502
     if status == 403 and "11140" in str(msg):
@@ -3430,7 +3472,9 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
         for chunk in iter_chunks(resp, ping):
             err = sse_error(chunk)
             if err:
-                raise UpstreamError(502, err)
+                # 脱敏错误信息
+                sanitized_err = _sanitize_for_log(str(err), max_len=300)
+                raise UpstreamError(502, sanitized_err)
             for e in acc.feed(chunk):
                 if e[1] != 0:
                     continue
@@ -3456,8 +3500,10 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
         raise
     except Exception as e:  # noqa: BLE001 - 上游中途断流：给客户端一个明确的失败事件
-        log("Responses 流中断：%s" % e)
-        acc.error = "上游响应流中断：%s" % e
+        # 脱敏异常信息用于日志
+        sanitized_msg = _sanitize_for_log(str(e), max_len=200)
+        log("Responses 流中断：%s" % sanitized_msg)
+        acc.error = "上游响应流中断：%s" % sanitized_msg
         acc.error_status = e.status if isinstance(e, UpstreamError) else 502
         failed = snapshot("failed", output)
         failed["error"] = {"code": "server_error", "message": acc.error}
@@ -4016,6 +4062,7 @@ def load_selection() -> None:
     """仅在完整读取有效配置后更新内存，编辑中的无效文件不会解除模型限制。"""
     global _selection, _aliases, _default_model, _enforce, _selection_mtime
     global _account_selections, _selection_owner, _selection_scoped
+    global _pool_selections, _pool_aliases
     with _lock, _selection_lock:
         try:
             mt = os.path.getmtime(SELECTION_FILE)
@@ -4034,7 +4081,30 @@ def load_selection() -> None:
                 raise ValueError("aliases 必须是模型名称之间的映射")
             if not isinstance(dm, str) or not isinstance(enforce, bool):
                 raise ValueError("默认模型或强制筛选开关的类型不正确")
-            profiles = raw.get("accounts", {})
+
+            # 加载池级别配置
+            pools = raw.get("pools", {})
+            if not isinstance(pools, dict):
+                raise ValueError("pools 必须是对象")
+            pool_selections = {}
+            pool_aliases_map = {}
+            for realm, config in pools.items():
+                if not isinstance(realm, str) or not isinstance(config, dict):
+                    raise ValueError(f"池 {realm} 配置格式不正确")
+                pool_models = config.get("models", [])
+                if not isinstance(pool_models, list) or any(not isinstance(i, str) for i in pool_models):
+                    raise ValueError(f"池 {realm} 的 models 必须是字符串数组")
+                pool_aliases_val = config.get("aliases", {})
+                if not isinstance(pool_aliases_val, dict) or any(
+                        not isinstance(k, str) or not isinstance(v, str)
+                        for k, v in pool_aliases_val.items()):
+                    raise ValueError(f"池 {realm} 的 aliases 必须是模型名称映射")
+                pool_selections[realm] = list(dict.fromkeys(i.strip() for i in pool_models if i.strip()))
+                pool_aliases_map[realm] = {k.strip(): v.strip()
+                                          for k, v in pool_aliases_val.items()
+                                          if k.strip() and v.strip()}
+
+            profiles = raw.get("accounts", )
             owner = raw.get("activeAccountId", "")
             if not isinstance(owner, str) or not isinstance(profiles, dict) or any(
                     not isinstance(key, str) or not key or not isinstance(value, list) or
@@ -4050,13 +4120,36 @@ def load_selection() -> None:
                     for key, value in profiles.items()}
         active = account_id(_auth) if _auth else ""
         scoped = "accounts" in raw
+
+        # 选择优先级：账号级别 > 池级别 > 全局级别
         if not scoped and active:
             profiles[active] = selected
         elif owner:
             profiles[owner] = selected
-        _selection = list(profiles.get(active, [])) if scoped else selected
+
+        # 确定当前账号的模型选择
+        if active in profiles:
+            # 账号有自己的配置，使用账号配置
+            _selection = list(profiles[active])
+        elif _auth and pools:
+            # 账号没有配置，使用池级别配置
+            realm = _realm(_auth.get("base", ""))
+            _selection = list(pool_selections.get(realm, []))
+        else:
+            # 使用全局配置
+            _selection = selected if not scoped else []
+
         _account_selections, _selection_owner, _selection_scoped = profiles, active, scoped
-        _aliases = {k.strip(): v.strip() for k, v in al.items() if k.strip() and v.strip()}
+        _pool_selections, _pool_aliases = pool_selections, pool_aliases_map
+
+        # 合并别名：池级别别名 + 全局别名（全局优先）
+        merged_aliases = {}
+        if _auth and pools:
+            realm = _realm(_auth.get("base", ""))
+            merged_aliases = dict(pool_aliases_map.get(realm, {}))
+        merged_aliases.update({k.strip(): v.strip() for k, v in al.items() if k.strip() and v.strip()})
+
+        _aliases = merged_aliases
         _default_model, _enforce, _selection_mtime = dm.strip(), enforce, mt
 
 
@@ -4107,7 +4200,8 @@ def _mask_api_key(key: str) -> str:
     """日志里只显示密钥前缀与后缀，避免完整密钥进入日志/监控系统。"""
     if not isinstance(key, str) or not key:
         return "***"
-    if len(key) > 15:
+    # 16 字符及以上才显示掩码，否则全部隐藏
+    if len(key) >= 16:
         return key[:7] + "..." + key[-4:]
     return "***"
 
@@ -4125,6 +4219,7 @@ def save_selection(ids: list | None = None, **extra) -> dict:
     """串行保存配置；落盘成功后才更新内存，部分更新不会覆盖并发修改。"""
     global _selection, _aliases, _default_model, _enforce, _selection_mtime
     global _account_selections, _selection_owner, _selection_scoped
+    global _pool_selections, _pool_aliases
     with _lock, _selection_lock:
         aid = account_id(_auth) if _auth else ""
         if extra.get("expected_account_id") is not None and extra["expected_account_id"] != aid:
@@ -4137,7 +4232,36 @@ def save_selection(ids: list | None = None, **extra) -> dict:
                        if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()}
         default = extra["default_model"].strip() if isinstance(extra.get("default_model"), str) else _default_model
         enforce = extra["enforce"] if isinstance(extra.get("enforce"), bool) else _enforce
+
+        # 处理池级别配置
+        pool_models = {realm: list(models) for realm, models in _pool_selections.items()}
+        pool_alias = {realm: dict(als) for realm, als in _pool_aliases.items()}
+
+        if isinstance(extra.get("poolModels"), dict):
+            for realm, models in extra["poolModels"].items():
+                if isinstance(models, list) and all(isinstance(m, str) for m in models):
+                    pool_models[realm] = list(dict.fromkeys(m.strip() for m in models if m.strip()))
+
+        if isinstance(extra.get("poolAliases"), dict):
+            for realm, als in extra["poolAliases"].items():
+                if isinstance(als, dict):
+                    pool_alias[realm] = {k.strip(): v.strip() for k, v in als.items()
+                                        if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()}
+
         payload = {"models": selected, "aliases": aliases, "default_model": default, "enforce": enforce}
+
+        # 添加池配置到 payload
+        if pool_models or pool_alias:
+            pools_payload = {}
+            all_realms = set(pool_models.keys()) | set(pool_alias.keys())
+            for realm in all_realms:
+                pools_payload[realm] = {}
+                if realm in pool_models:
+                    pools_payload[realm]["models"] = pool_models[realm]
+                if realm in pool_alias:
+                    pools_payload[realm]["aliases"] = pool_alias[realm]
+            payload["pools"] = pools_payload
+
         profiles = {key: list(value) for key, value in _account_selections.items()}
         if aid:
             profiles[aid] = list(selected)
@@ -4145,9 +4269,12 @@ def save_selection(ids: list | None = None, **extra) -> dict:
         _write_private(SELECTION_FILE, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         _selection, _aliases, _default_model, _enforce = selected, aliases, default, enforce
         _account_selections, _selection_owner, _selection_scoped = profiles, aid, True
+        _pool_selections, _pool_aliases = pool_models, pool_alias
         _selection_mtime = os.path.getmtime(SELECTION_FILE)
         return {"ok": True, "accountId": aid, "selected": list(selected), "aliases": dict(aliases),
-                "defaultModel": default, "enforce": enforce}
+                "defaultModel": default, "enforce": enforce,
+                "poolModels": {realm: list(models) for realm, models in pool_models.items()},
+                "poolAliases": {realm: dict(als) for realm, als in pool_alias.items()}}
 
 
 # ---------------------------------------------------------------------------
@@ -4376,6 +4503,8 @@ def admin_state() -> dict:
         summaries = [account_summary(value) for value in accounts.values()]
         selected = list(_selection)
         aliases, default_model, enforce = dict(_aliases), _default_model, _enforce
+        pool_models = {realm: list(models) for realm, models in _pool_selections.items()}
+        pool_alias = {realm: dict(als) for realm, als in _pool_aliases.items()}
     logged_in = bool(a and a.get("accessToken"))
     host = "127.0.0.1" if _is_loopback(_BIND_HOST) or _BIND_HOST in ("0.0.0.0", "::") \
         else _BIND_HOST
@@ -4393,6 +4522,8 @@ def admin_state() -> dict:
         "aliases": aliases,
         "defaultModel": default_model,
         "enforce": enforce,
+        "poolModels": pool_models,
+        "poolAliases": pool_alias,
         "modelsCached": bool(_models_cache["data"]),
         "usage": usage_summary(),
     }
@@ -5126,7 +5257,9 @@ class Handler(BaseHTTPRequestHandler):
                     for obj in iter_chunks(resp, ping):
                         err = sse_error(obj)
                         if err:
-                            raise UpstreamError(502, "上游返回错误：%s" % err)
+                            # 脱敏错误信息用于日志和客户端
+                            sanitized_err = _sanitize_for_log(str(err), max_len=300)
+                            raise UpstreamError(502, "上游返回错误：%s" % sanitized_err)
                         u = obj.get("usage")
                         if u.__class__ is dict:           # chat 流只需 usage（用量记录），不必累加全文
                             acc.usage = u
@@ -5138,11 +5271,13 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     raise
                 except Exception as e:  # noqa: BLE001 - 上游中途断流
-                    log("chat 流中断：%s" % e)
-                    acc.error = "上游响应流中断：%s" % e
+                    # 脱敏异常信息用于日志
+                    sanitized_msg = _sanitize_for_log(str(e), max_len=200)
+                    log("chat 流中断：%s" % sanitized_msg)
+                    acc.error = "上游响应流中断：%s" % sanitized_msg
                     acc.error_status = e.status if isinstance(e, UpstreamError) else 502
                     self._chunk("data: %s\n\n" % json.dumps(
-                        {"error": {"message": "上游响应流中断：%s" % e,
+                        {"error": {"message": "上游响应流中断：%s" % sanitized_msg,
                                    "type": "upstream_error"}}, ensure_ascii=False))
                 self._chunk("data: [DONE]\n\n")
             elif path == "/v1/messages":

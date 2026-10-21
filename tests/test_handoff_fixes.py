@@ -87,8 +87,9 @@ class UpstreamRetryTests(unittest.TestCase):
         self.addCleanup(setattr, wb, "_gzip_ok", saved[0])
         self.addCleanup(setattr, wb, "GZIP_MIN", saved[1])
         base = wb.upstream_base(self.account)
-        wb._gzip_disabled_bases.discard(base)
-        self.addCleanup(wb._gzip_disabled_bases.discard, base)
+        with wb._gzip_stats_lock:
+            wb._gzip_disabled_bases.pop(base, None)
+        self.addCleanup(lambda: wb._gzip_disabled_bases.pop(base, None))
         response = _Response(400, b'{"code":11102,"msg":"model not allowed"}')
         with mock.patch.object(wb, "upstream_request", return_value=response) as request:
             result = wb.call_upstream({"model": "m", "messages": [{"content": "x" * 100}]},

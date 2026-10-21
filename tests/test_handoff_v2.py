@@ -47,13 +47,13 @@ class UpstreamSafetyTests(unittest.TestCase):
         wb._gzip_ok, wb.GZIP_MIN, wb.UPSTREAM_RETRIES = True, 1, 2
         self.base = wb.upstream_base(self.account)
         with wb._gzip_stats_lock:
-            wb._gzip_disabled_bases.discard(self.base)
+            wb._gzip_disabled_bases.pop(self.base, None)
         self.addCleanup(self.restore)
 
     def restore(self):
         wb._gzip_ok, wb.GZIP_MIN, wb.UPSTREAM_RETRIES = self.saved
         with wb._gzip_stats_lock:
-            wb._gzip_disabled_bases.discard(self.base)
+            wb._gzip_disabled_bases.pop(self.base, None)
 
     def invoke(self, responses):
         with mock.patch.object(wb, "upstream_request", side_effect=responses) as request, \
