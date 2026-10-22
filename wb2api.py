@@ -1056,7 +1056,8 @@ def activate_account(a: dict) -> dict:
             if not _selection_scoped and os.path.exists(SELECTION_FILE):
                 payload = {"models": list(_selection), "accounts": profiles, "activeAccountId": owner,
                            "aliases": dict(_aliases), "default_model": _default_model, "enforce": _enforce,
-                           "accountUseOwnModels": dict(_account_use_own_models)}
+                           "accountUseOwnModels": dict(_account_use_own_models),
+                           "pools": _pools_payload()}
                 _write_private(SELECTION_FILE, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
                 _selection_mtime = os.path.getmtime(SELECTION_FILE)
                 _selection_scoped = True
@@ -4133,12 +4134,11 @@ def load_selection() -> None:
         elif owner:
             profiles[owner] = selected
 
-        # 确定当前账号的模型选择
-        if active in profiles:
-            # 账号有自己的配置，使用账号配置
-            _selection = list(profiles[active])
+        # 确定当前账号的模型选择：账户级开关优先，关闭时才回退到池级
+        if active and use_own_models.get(active, True):
+            _selection = list(profiles.get(active, []))
         elif _auth and pools:
-            # 账号没有配置，使用池级别配置
+            # 账号关闭了账户级模型，使用池级别配置
             realm = _pool_realm(_auth)
             _selection = list(pool_selections.get(realm, []))
         else:
@@ -4211,6 +4211,19 @@ def _mask_api_key(key: str) -> str:
     if len(key) >= 16:
         return key[:7] + "..." + key[-4:]
     return "***"
+
+
+def _pools_payload() -> dict:
+    """把内存里的池级模型与别名组装成 selection.json 的 pools 字段。"""
+    out = {}
+    for realm in set(_pool_selections) | set(_pool_aliases):
+        entry = {}
+        if realm in _pool_selections:
+            entry["models"] = list(_pool_selections[realm])
+        if realm in _pool_aliases:
+            entry["aliases"] = dict(_pool_aliases[realm])
+        out[realm] = entry
+    return out
 
 
 def selection_for_account(a: dict) -> list[str]:
@@ -4287,7 +4300,9 @@ def save_selection(ids: list | None = None, **extra) -> dict:
             payload["pools"] = pools_payload
 
         profiles = {key: list(value) for key, value in _account_selections.items()}
-        if aid:
+        # 只有显式传了 ids 才改写该账户的勾选：保存池级配置或切换开关时，
+        # 不能顺手把当前 _selection（可能为空、可能属于别的层级）固化成账户配置。
+        if aid and ids is not None:
             profiles[aid] = list(selected)
         payload.update(accounts=profiles, activeAccountId=aid, accountUseOwnModels=use_own_models)
         _write_private(SELECTION_FILE, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
@@ -4296,18 +4311,20 @@ def save_selection(ids: list | None = None, **extra) -> dict:
         _pool_selections, _pool_aliases = pool_models, pool_alias
         _account_use_own_models = use_own_models
         _selection_mtime = os.path.getmtime(SELECTION_FILE)
-        return {"ok": True, "accountId": aid, "selected": list(selected), "aliases": dict(aliases),
+        # 返回真正生效的集合（可能是池级），否则切换开关后前端会显示一份不再生效的清单
+        effective = selection_for_account(_auth) if _auth else list(selected)
+        return {"ok": True, "accountId": aid, "selected": effective, "aliases": dict(aliases),
                 "defaultModel": default, "enforce": enforce,
                 "poolModels": {realm: list(models) for realm, models in pool_models.items()},
                 "poolAliases": {realm: dict(als) for realm, als in pool_alias.items()},
-                "useAccountModels": use_own_models.get(aid, False)}
+                "useAccountModels": use_own_models.get(aid, True)}
 
 
 # ---------------------------------------------------------------------------
 # 用量记录：每个请求一行 usage.jsonl，控制台据此估算积分消耗
 # ---------------------------------------------------------------------------
 _usage_lock = threading.Lock()
-_usage_tot: dict = {"day": "", "today": {}, "month": "", "this_month": {}, "by_account": {}, "by_account_period": {}}
+_usage_tot: dict = {"day": "", "today": {}, "month": "", "this_month": {}, "by_account_period": {}}
 
 
 def _credit_factor(model: str, account: dict | None = None) -> float | None:
@@ -4338,13 +4355,13 @@ def _parse_factor(s) -> float | None:
         return None
 
 
-def _bump(bucket: dict, rec: dict) -> None:
-    """累计一条用量记录。字段类型一律归一，损坏的 replay 数据不能把统计打崩。"""
-    key = rec.get("model")
-    if not isinstance(key, str):
-        key = ""
-    m = bucket.setdefault(key, {"requests": 0, "errors": 0, "input_tokens": 0,
-                                "output_tokens": 0, "weighted_k": 0.0, "credits": 0.0})
+def _empty_totals() -> dict:
+    return {"requests": 0, "errors": 0, "input_tokens": 0,
+            "output_tokens": 0, "weighted_k": 0.0, "credits": 0.0}
+
+
+def _accumulate(m: dict, rec: dict) -> None:
+    """把一条记录累加进任意统计桶。字段类型一律归一，损坏的 replay 数据不能把统计打崩。"""
     m["requests"] += 1
     if to_int(rec.get("status")) >= 400:
         m["errors"] += 1
@@ -4360,25 +4377,12 @@ def _bump(bucket: dict, rec: dict) -> None:
         m["weighted_k"] = round(m.get("weighted_k", 0.0) + factor * (tokens_in + tokens_out) / 1000, 3)
 
 
-def _bump_account(bucket: dict, rec: dict) -> None:
-    """按账户聚合用量（只统计总量，不分模型）。"""
-    aid = rec.get("accountId")
-    if not isinstance(aid, str) or not aid:
-        aid = "(未知账户)"
-    m = bucket.setdefault(aid, {"requests": 0, "errors": 0, "input_tokens": 0,
-                                "output_tokens": 0, "weighted_k": 0.0, "credits": 0.0})
-    m["requests"] += 1
-    if to_int(rec.get("status")) >= 400:
-        m["errors"] += 1
-    tokens_in, tokens_out = to_int(rec.get("in")), to_int(rec.get("out"))
-    m["input_tokens"] += tokens_in
-    m["output_tokens"] += tokens_out
-    credit = rec.get("credit")
-    if isinstance(credit, (int, float)) and not isinstance(credit, bool):
-        m["credits"] = round(m.get("credits", 0.0) + credit, 4)
-    factor = rec.get("factor")
-    if isinstance(factor, (int, float)) and not isinstance(factor, bool):
-        m["weighted_k"] = round(m.get("weighted_k", 0.0) + factor * (tokens_in + tokens_out) / 1000, 3)
+def _bump(bucket: dict, rec: dict) -> None:
+    """按模型累计一条用量记录。"""
+    key = rec.get("model")
+    if not isinstance(key, str):
+        key = ""
+    _accumulate(bucket.setdefault(key, _empty_totals()), rec)
 
 
 def _bump_account_period_model(bucket: dict, rec: dict, period: str) -> None:
@@ -4399,20 +4403,7 @@ def _bump_account_period_model(bucket: dict, rec: dict, period: str) -> None:
     if not isinstance(model, str):
         model = ""
 
-    m = period_bucket.setdefault(model, {"requests": 0, "errors": 0, "input_tokens": 0,
-                                         "output_tokens": 0, "weighted_k": 0.0, "credits": 0.0})
-    m["requests"] += 1
-    if to_int(rec.get("status")) >= 400:
-        m["errors"] += 1
-    tokens_in, tokens_out = to_int(rec.get("in")), to_int(rec.get("out"))
-    m["input_tokens"] += tokens_in
-    m["output_tokens"] += tokens_out
-    credit = rec.get("credit")
-    if isinstance(credit, (int, float)) and not isinstance(credit, bool):
-        m["credits"] = round(m.get("credits", 0.0) + credit, 4)
-    factor = rec.get("factor")
-    if isinstance(factor, (int, float)) and not isinstance(factor, bool):
-        m["weighted_k"] = round(m.get("weighted_k", 0.0) + factor * (tokens_in + tokens_out) / 1000, 3)
+    _accumulate(period_bucket.setdefault(model, _empty_totals()), rec)
 
 
 
@@ -4446,7 +4437,6 @@ def record_usage(path: str, model: str, status: int, usage: dict | None, secs: f
         _roll_usage(day, month)
         _bump(_usage_tot["today"], rec)
         _bump(_usage_tot["this_month"], rec)
-        _bump_account(_usage_tot["by_account"], rec)
         _bump_account_period_model(_usage_tot["by_account_period"], rec, "today")
         _bump_account_period_model(_usage_tot["by_account_period"], rec, "this_month")
         try:
@@ -4488,26 +4478,22 @@ def _usage_fh():
 
 def _roll_usage(day: str, month: str) -> None:
     if _usage_tot["day"] != day:
-        _usage_tot.update(day=day, today={}, by_account={})
+        _usage_tot.update(day=day, today={})
         # 重置 by_account_period 的 today
-        for aid in list(_usage_tot.get("by_account_period", {}).keys()):
-            if aid in _usage_tot["by_account_period"]:
-                _usage_tot["by_account_period"][aid]["today"] = {}
+        for aid in _usage_tot.get("by_account_period", {}):
+            _usage_tot["by_account_period"][aid]["today"] = {}
     if _usage_tot["month"] != month:
         _usage_tot.update(month=month, this_month={})
         # 重置 by_account_period 的 this_month
-        for aid in list(_usage_tot.get("by_account_period", {}).keys()):
-            if aid in _usage_tot["by_account_period"]:
-                _usage_tot["by_account_period"][aid]["this_month"] = {}
-
-
+        for aid in _usage_tot.get("by_account_period", {}):
+            _usage_tot["by_account_period"][aid]["this_month"] = {}
 
 
 def load_usage_totals() -> None:
     """启动时从 usage.jsonl 回放本月数据（只读尾部 4MB，足够覆盖一个月的个人用量）。"""
     day, month = time.strftime("%Y-%m-%d"), time.strftime("%Y-%m")
     with _usage_lock:
-        _usage_tot.update(day=day, today={}, month=month, this_month={}, by_account={}, by_account_period={})
+        _usage_tot.update(day=day, today={}, month=month, this_month={}, by_account_period={})
         try:
             size = os.path.getsize(USAGE_FILE)
             with open(USAGE_FILE, "rb") as f:
@@ -4533,20 +4519,35 @@ def load_usage_totals() -> None:
                 _bump_account_period_model(_usage_tot["by_account_period"], rec, "this_month")
                 if time.strftime("%Y-%m-%d", t) == day:
                     _bump(_usage_tot["today"], rec)
-                    _bump_account(_usage_tot["by_account"], rec)
                     _bump_account_period_model(_usage_tot["by_account_period"], rec, "today")
             except Exception:  # noqa: BLE001 - 单行损坏不影响其余统计
                 continue
 
+
+def _account_today(periods: dict) -> dict:
+    """把某账户的 by_account_period.today 按模型求和成单条总量。"""
+    total = _empty_totals()
+    for m in (periods.get("today") or {}).values():
+        if not isinstance(m, dict):
+            continue
+        for key in ("requests", "errors", "input_tokens", "output_tokens"):
+            total[key] += to_int(m.get(key))
+        for key in ("weighted_k", "credits"):
+            value = m.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                total[key] = round(total[key] + value, 4)
+    return total
 
 
 def usage_summary() -> dict:
     day, month = time.strftime("%Y-%m-%d"), time.strftime("%Y-%m")
     with _usage_lock:
         _roll_usage(day, month)
+        by_account = {aid: _account_today(periods)
+                      for aid, periods in _usage_tot["by_account_period"].items()}
         return json.loads(json.dumps({"today": _usage_tot["today"],
                                       "month": _usage_tot["this_month"],
-                                      "by_account": _usage_tot["by_account"],
+                                      "by_account": by_account,
                                       "by_account_period": _usage_tot["by_account_period"],
                                       "day": day, "monthName": month}))
 
@@ -4603,11 +4604,11 @@ def admin_state() -> dict:
         if a:
             accounts[account_id(a)] = a
         summaries = [account_summary(value) for value in accounts.values()]
-        selected = list(_selection)
+        selected = selection_for_account(a) if a else list(_selection)
         aliases, default_model, enforce = dict(_aliases), _default_model, _enforce
         pool_models = {realm: list(models) for realm, models in _pool_selections.items()}
         pool_alias = {realm: dict(als) for realm, als in _pool_aliases.items()}
-        use_account_models = _account_use_own_models.get(account_id(a) if a else "", False)
+        use_account_models = _account_use_own_models.get(account_id(a) if a else "", True)
     logged_in = bool(a and a.get("accessToken"))
     host = "127.0.0.1" if _is_loopback(_BIND_HOST) or _BIND_HOST in ("0.0.0.0", "::") \
         else _BIND_HOST
@@ -5006,7 +5007,13 @@ class Handler(BaseHTTPRequestHandler):
                     a = ensure_auth()
                 except Exception as e:  # noqa: BLE001
                     return self._error(400, str(e))
-                cat = fetch_catalog(a)
+                # ?refresh=1 强制向上游重新探测，绕过 MODELS_TTL 缓存
+                if self._query("refresh") in ("1", "true", "yes"):
+                    cat = _fetch_catalog_locked(a)
+                    cat = {"models": cat.get("models") or [],
+                           "promotions": cat.get("promotions") or []}
+                else:
+                    cat = fetch_catalog(a)
                 return self._json(200, {
                     "accountId": account_id(a),
                     "models": cat["models"],
@@ -5214,15 +5221,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(400, "useAccountModels 必须是布尔值", "invalid_request_error")
                 aid = account_id(a)
                 try:
-                    saved = save_selection(useAccountModels=use_account)
-                    # 返回实际生效的选择（可能因为池级为空而与用户勾选的不同）
-                    selected = list(selection_for_account(a))
-                except (ValueError, RuntimeError) as e:
+                    # 与 /admin/selection 相同的切换竞态保护
+                    saved = save_selection(useAccountModels=use_account,
+                                           expected_account_id=body.get("accountId"))
+                except ValueError as e:
                     return self._error(409, str(e), "invalid_request_error")
                 except OSError as e:
                     return self._error(500, "保存配置失败：%s" % e)
                 log("账户 %s 已%s账户级模型" % (account_name(a) or aid, "启用" if use_account else "禁用"))
-                return self._json(200, {"ok": True, "useAccountModels": use_account, "selected": selected})
+                return self._json(200, {"ok": True, "useAccountModels": saved["useAccountModels"],
+                                        "selected": saved["selected"]})
             if path == "/admin/models/refresh":
                 try:
                     a = ensure_auth()

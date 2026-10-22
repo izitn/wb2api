@@ -669,7 +669,7 @@ function acceptPoints(p, aid){
   return true;
 }
 async function loadPoints(){
-  if(!STATE || !STATE.loggedIn || checkinBusy) return;
+  if(!STATE || !STATE.loggedIn) return;
   const aid = STATE.activeAccountId, generation = ++pointsGeneration;
   pointsBusy = true; renderAccountTools();
   try{
@@ -680,23 +680,6 @@ async function loadPoints(){
       STATE.points = {...(STATE.points || {}), error:e.message};
   }finally{
     if(generation === pointsGeneration){ pointsBusy = false; renderAccountTools(); }
-  }
-}
-async function checkin(){
-  if(!STATE || !STATE.loggedIn || checkinBusy) return;
-  const aid = STATE.activeAccountId, generation = ++pointsGeneration;
-  checkinBusy = true; renderAccountTools();
-  try{
-    const p = await api('/admin/points/checkin',{method:'POST',body:'{}'});
-    // 签到成功后的余额必须压过签到开始前已发出的旧查询。
-    if(generation === pointsGeneration && acceptPoints(p, aid)) pointsGeneration++;
-  }catch(e){
-    if(generation === pointsGeneration && STATE.activeAccountId === aid)
-      STATE.points = {...(STATE.points || {}), checkinMessage:'签到失败：' + e.message};
-  }finally{
-    pointsBusy = false;
-    if(STATE.activeAccountId === aid) renderAccountTools();
-    checkinBusy = false; renderAccountTools();
   }
 }
 async function setAutoCheckin(){
@@ -818,9 +801,11 @@ async function loadModels(force){
     if(generation !== modelsGeneration) return;
     CATALOG = {models: d.models || [], promotions: d.promotions || []};
     if(revision !== saveRevision) return;
-    if(d.selected) SELECTED = new Set(d.selected);
+    // 未保存的勾选优先于服务端返回值；目录里已消失的 id 不能重新进入选择集
+    const ids = modelIndex().ids;
+    const source = pendingSelections.get(STATE.activeAccountId) || d.selected || [];
+    SELECTED = new Set(source.filter(id => ids.has(id)));
     renderModels();
-    $('#models-status').textContent = '';
   }catch(e){
     if(generation !== modelsGeneration) return;
     $('#models-status').textContent = '目录拉取失败：' + e.message;
@@ -979,19 +964,28 @@ function retrySave(){
 }
 async function toggleAccountModels(){
   const useAccount = $('#use-account-models').checked;
-  if(!STATE?.loggedIn) return;
-
+  if(accountSwitching || loginBusy || !STATE?.loggedIn){
+    $('#use-account-models').checked = !useAccount;
+    return;
+  }
+  // 先落盘防抖中的勾选，避免切换后它们被写到另一个层级
+  await flushSelections();
+  const revision = ++saveRevision;
   try{
     $('#save-status').textContent = '正在切换模型配置级别…';
     const d = await api('/admin/toggle-account-models', {
       method: 'POST',
-      body: JSON.stringify({useAccountModels: useAccount})
+      body: JSON.stringify({useAccountModels: useAccount, accountId: STATE.activeAccountId})
     });
-
-    if(d.selected) SELECTED = new Set(d.selected);
+    // 状态以服务端返回为准：它决定之后每次保存该写账户级还是池级
+    STATE.useAccountModels = !!d.useAccountModels;
+    $('#use-account-models').checked = STATE.useAccountModels;
+    if(revision === saveRevision && d.selected) SELECTED = new Set(d.selected);
     renderModels();
-    $('#save-status').textContent = useAccount ? '已切换到账户级模型' : '已切换到池级模型';
-    setTimeout(() => $('#save-status').textContent = '', 2000);
+    const msg = STATE.useAccountModels ? '已切换到账户级模型' : '已切换到池级模型';
+    const shown = $('#save-status');
+    shown.textContent = msg;
+    setTimeout(() => { if(shown.textContent === msg) shown.textContent = ''; }, 2000);
   }catch(e){
     $('#save-status').textContent = '切换失败：' + e.message;
     $('#use-account-models').checked = !useAccount;
@@ -1131,11 +1125,11 @@ function renderUsage(){
   }
 
   const html = accountIds.map(aid => {
-    const acct = STATE.accounts && STATE.accounts.find(a => a.account_id === aid);
-    const acctName = acct ? acct.account_id : aid;
     const periods = byAcctPeriod[aid];
+    // 账户名优先用后端聚合时记下的 name，其次按 id 查账户列表
+    const acct = (STATE.accounts || []).find(a => a.id === aid);
+    const acctName = periods.name || (acct && (acct.displayName || acct.nickname)) || aid;
 
-    // 只提取 today 和 this_month，忽略 name 字段
     const todayData = periods.today || {};
     const monthData = periods.this_month || {};
 

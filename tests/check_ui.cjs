@@ -216,7 +216,7 @@ check("提取 baseUrl、chosen、renderOut 函数并模拟执行", () => {
   
   // 验证 Anthropic 配置生成
   sandbox.__renderOut();
-  const anthropicOut = JSON.parse(outText.value);
+  const anthropicOut = JSON.parse(outText.textContent);
   
   if (anthropicOut.env.ANTHROPIC_BASE_URL !== "http://127.0.0.1:8787") {
     throw new Error("Anthropic BASE_URL 应为 origin（不含 /v1），实际：" + anthropicOut.env.ANTHROPIC_BASE_URL);
@@ -233,7 +233,7 @@ check("提取 baseUrl、chosen、renderOut 函数并模拟执行", () => {
   // 验证 OpenAI 配置（默认分支输出 shell 变量，不是 JSON）
   sandbox.TAB = "openai";
   sandbox.__renderOut();
-  const openaiOut = outText.value;
+  const openaiOut = outText.textContent;
 
   if (!openaiOut.includes("export OPENAI_BASE_URL=http://127.0.0.1:8787/v1")) {
     throw new Error("OpenAI BASE_URL 应为 origin + '/v1'");
@@ -250,7 +250,7 @@ check("提取 baseUrl、chosen、renderOut 函数并模拟执行", () => {
   // 验证 Codex 配置（使用 Responses API；密钥通过环境变量传入）
   sandbox.TAB = "codex";
   sandbox.__renderOut();
-  const codexOut = outText.value;
+  const codexOut = outText.textContent;
 
   if (!codexOut.includes('model = "model-alpha"')) {
     throw new Error("Codex model 应为实际模型 ID");
@@ -275,7 +275,7 @@ check("提取 baseUrl、chosen、renderOut 函数并模拟执行", () => {
   // 验证 JSON 分支可被解析且包含接入信息
   sandbox.TAB = "json";
   sandbox.__renderOut();
-  const jsonOut = JSON.parse(outText.value);
+  const jsonOut = JSON.parse(outText.textContent);
 
   if (jsonOut.baseUrl !== "http://127.0.0.1:8787/v1"
       || jsonOut.apiKey !== "sk-test-key"
