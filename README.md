@@ -1,344 +1,199 @@
 # wb2api-lite
 
-> ## ⚠️ 使用前必读（作者自述）
+> ## ⚠️ 使用前必读
 >
-> **本项目纯属个人自用的小玩具。**
->
-> - **作者不是程序员**，一行代码也看不懂。整个项目是在 AI 辅助下"做着玩"的产物，代码的交付目标是"在我自己的机器上能跑"，而不是"在别人机器上一定可靠"。
-> - **不提供任何质量保证、兼容性承诺或技术支持。** 任何 bug、数据丢失、账号异常、积分/额度损失、上游封禁或违反服务条款的后果，**全部由使用者自行承担**。
-> - **这不是给第三方分发、打包售卖或搭建公共服务用的。** 请只用你自己的账号、只在你自己的机器上自用（理想情况仅监听 `127.0.0.1`）。
-> - 上游接口随时可能变更，签名/校验/签到/积分等逻辑**可能随时失效**，作者不保证跟进修复。
-> - 仓库里的说明文档同样是 AI 生成的，**可能过期、夸大或出错**，请以实际代码行为为准。
-> - 继续使用即表示你已理解并接受以上全部内容。**如果你看不懂上面在说什么，请不要使用本项目。**
+> - 本项目是个人自用工具，**不提供任何质量保证或技术支持**。账号异常、封禁、积分损失或违反服务条款的后果由使用者自行承担。
+> - 只用你自己的账号，只在你自己的机器上运行（建议仅监听 `127.0.0.1`），不要用于分发、售卖或搭建公共服务。
+> - 上游接口和风控规则随时可能变化，本文档描述的是当前代码的行为，不保证对上游一直有效。
 
-`wb2api-lite` 是一个本地代理：它使用 WorkBuddy 登录态访问上游服务，并提供 OpenAI / Anthropic 兼容接口和中文网页控制台。
-
-账号、令牌、访问密钥、模型缓存和历史用量保存在本机数据目录。首次运行会生成所需文件；分享项目时不要包含这些运行时文件。
+`wb2api-lite` 是一个单文件本地代理（`wb2api.py`，仅依赖 Python 标准库）：用 WorkBuddy 的登录态访问上游，对外提供 OpenAI / Anthropic 兼容接口和一个中文网页控制台（`ui.html`）。
 
 ## 快速开始
 
-需要 Python 3.10 或更高版本。
+需要 Python 3.10+。
 
-```powershell
+```bash
 python wb2api.py
 ```
 
-打开 `http://127.0.0.1:8787/`，在网页中选择国际版或国内版登录。登录完成后，顶部显示当前用户名、账号版本和积分余额；接口地址和密钥在“接入配置”中查看、复制。
+浏览器打开 `http://127.0.0.1:8787/`，选择国际版或国内版登录。接口地址与访问密钥在控制台“接入配置”页查看。
 
-国内 WorkBuddy 与 CodeBuddy 使用同一账号体系，国内版积分共享，不需要分别保存两套账号。
-
-## 主要功能
-
-- 支持国际版和国内版登录，重新登录时可以重新选择版本。
-- 支持保存多个账号，下拉选择后立即热切换，自动刷新该账号的积分和模型，无需再点切换按钮。
-- **账号池**：国际版与国内版各自成一个池，池内自动换号 + 会话粘性（见下节）。
-- 显示当前用户名和当前账户积分余额。
-- 模型按倍率升序或降序排列。
-- 勾选模型按账户分别保存，切换账户时自动恢复对应选择，重启后仍保留。
-- 模型目录、导出配置和客户端模型列表只展示倍率明确的模型，保留零倍率和有效优惠项。
-- “低倍率 ≤1”包含有效倍率为 `0` 的模型，搜索支持模型 ID 和显示名称。
-- 国内版个人账号支持手动“签到领积分”和每日自动签到。
-- Windows 当前用户登录后可后台启动本项目的 `wb2api.py`，无需管理员权限。
-- 自动签到开关位于“可用积分”卡片内，wb2api 自启开关位于侧栏底部。
-- 支持 `/v1/chat/completions`、`/v1/responses`、Anthropic `/v1/messages` 和 `/v1/models`。
-
-## 账号池（池内自动换号 + 会话粘性）
-
-保存了多个账号时，程序会按区域把它们分成**两个互相独立的池**：国际版池、国内版池。
-**绝不跨池**——两个区域的令牌、上游域名和出站身份都不同，混用会打到错误的上游。
-
-**选号顺序**：会话粘性命中 → 当前账号 → 池内其他可用账号。
-只有**一个账号**时行为与以前完全一致，不会产生任何额外请求。
-
-**自动换号**：请求在向客户端写出任何字节之前，如果遇到 `401 / 402 / 403 / 429 / 5xx`，
-会把该账号放进冷却，并在同池内换一个账号重试（单请求最多换 3 次）。
-`400 / 404` 这类请求本身的错误**不换号**，避免在池里把同一个错误跑一遍、白烧积分。
-
-**冷却与熔断**：
-
-| 情况 | 处置 |
-| --- | --- |
-| `429` 限流 | 软冷却，从 600 秒起指数退避，封顶 2 小时 |
-| `401 / 403` 授权失效 | 立即冷却 600 秒，等令牌刷新或重新登录 |
-| `402` 余额/积分不足 | 硬冷却 1 小时，避免反复烧请求 |
-| `5xx` 连续 3 次 | 熔断 30 分钟 |
-
-**会话粘性**：客户端带下列任一请求头时，同一会话会被固定在同一个账号上，
-避免多轮上下文在两个账号间跳变：
-
-- `X-Session-Id`
-- `X-Conversation-Id`
-- `Session-Id`
-- `X-Claude-Code-Session`
-
-粘性有效期 30 分钟（滑动续期），粘性账号进入冷却时会自动解绑并改投他人。
-不带这些请求头时**不做粘性**，退化为"当前账号优先"。
-
-> 换号只改变"这一次请求用哪个账号"，**不会**改动控制台上的当前账号。
-> 当前账号是你在界面上的选择，账号池是容错策略，两者互不覆盖。
-
-状态查看：`GET /healthz` 里的 `pool` 字段，或控制台接口 `GET /admin/pool`。
-
-所有参数都能用环境变量调整：`WB_POOL`（`0` 关闭账号池）、`WB_POOL_SOFT_COOLDOWN`、
-`WB_POOL_SOFT_MAX`、`WB_POOL_HARD_COOLDOWN`、`WB_POOL_FAIL_THRESHOLD`、`WB_POOL_BREAKER`、
-`WB_POOL_STICKY_TTL`、`WB_POOL_MAX_SWITCH`、`WB_POOL_SWITCH_DELAY`（账号切换延时，默认 5 秒）。
-
-### 其他可配置参数
-
-代理层面的性能与容量也支持通过环境变量调整：
-
-| 环境变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `WB_MAX_BODY` | `16777216` (16MB) | 请求体大小上限（字节），最小 1MB，最大 256MB |
-| `WB_MAX_INFLIGHT` | `8` | 同时在途的对话请求上限（降低以避免触发风控） |
-| `WB_CLIENT_TIMEOUT` | `120` | 下游连接空闲超时（秒），范围 30-3600 |
-| `WB_DRAIN_BODY_MAX` | `1048576` (1MB) | chunked 请求体排空上限（字节） |
-| `WB_POOL_IDLE_TTL` | `40` | 连接池空闲超时（秒），范围 10-120 |
-| `WB_GZIP_MIN` | `16384` (16KB) | gzip 压缩阈值（字节），`0` 禁用压缩 |
-| `WB_GZIP_DISABLE_TTL` | `1800` (30分钟) | gzip 被拒后禁用时长（秒），`0` 永久禁用 |
-| `WB_POOL_SWITCH_DELAY` | `5.0` | 账号切换后的延时（秒），避免过快触发风控 |
-
-**风控相关配置**（2026-10 腾讯加强了对 system 消息的内容审核）：
-
-| 环境变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `WB_LIMIT_SYSTEM_LENGTH` | `1` | 是否限制 system 消息长度（`1` 启用，`0` 禁用） |
-| `WB_MAX_SYSTEM_LENGTH` | `500` | system 消息最大长度（字节），超出部分将被截断 |
-| `WB_REMOVE_SYSTEM` | `0` | 是否完全移除 system 消息（`1` 启用，可能影响对话质量） |
-| `WB_SYSTEM_TO_USER` | `0` | 是否将过长的 system 转为首条 user 消息（`1` 启用） |
-| `WB_DEFAULT_SYSTEM` | `You are a helpful assistant.` | 默认的 system 消息内容 |
-
-**常见场景**：
-
-- **长上下文对话遇到 413 错误**：提高 `WB_MAX_BODY` 到 `67108864`（64MB）或更高
-- **网络不稳定**：延长 `WB_CLIENT_TIMEOUT` 到 `180` 或 `300`
-- **高并发场景**：延长 `WB_POOL_IDLE_TTL` 到 `60`，增加连接复用率
-- **触发风控**：降低 `WB_MAX_INFLIGHT` 到 `4` 或 `2`，增加 `WB_POOL_SWITCH_DELAY` 到 `10`
-- **403 错误 (code=11140)**：这是 2026-10 起腾讯加强的内容审核
-  - 首选方案：启用 system 消息长度限制（默认已启用）
-  - 如果问题持续：设置 `WB_REMOVE_SYSTEM=1` 完全移除 system 消息
-  - 或者：设置 `WB_SYSTEM_TO_USER=1` 将长 system 转为 user 消息
-  - 同时建议：降低 `WB_MAX_SYSTEM_LENGTH` 到 `300` 或更低
-
-## 网页控制台
-
-控制台按用途分成三个页面，顶部始终展示当前账户和余额。手机上，wb2api 自启开关位于顶部导航下方。
-
-| 页面   | 用途                                |
-| ---- | --------------------------------- |
-| 模型管理 | 搜索倍率明确的模型、按倍率排序、快速勾选，修改后自动保存到当前账户 |
-| 接入配置 | 复制接口地址和密钥，生成客户端配置；密钥默认遮挡，可点击显示    |
-| 用量统计 | 按今日或本月查看代理请求数、错误数、词元和积分消耗         |
-
-点击“添加账户”可重新选择国际版或国内版并授权。已保存账户在下拉菜单选择后立即成为当前账户；切换失败时恢复原选择，并显示失败原因。切换后会自动请求积分和模型，查询过程中显示加载状态，旧账户的延迟响应不会覆盖当前账户积分。查询缓慢时仍可继续切换其他账户。
-
-每个账户单独保存模型勾选，新账户初始未勾选。旧版全局勾选会归到迁移时的当前账户，不会复制给其他账户。保存失败的修改与重试也按账户隔离；另一个标签页切换账号后，旧页面的保存请求会被拒绝，避免写到错误账户。
-
-连续勾选在 200 毫秒窗口内合并保存，请求在途时只保留最新待保存结果。切换账户或开始登录时会立即提交并等待这些修改；关闭页面前请确认显示“已保存到当前账户”。单次勾选仅更新对应行，倍率和优惠索引在目录更新时重建。同一账户重叠的目录刷新、积分查询共用在途请求，不同账户独立处理。
-
-控制台支持窄屏和系统深色模式，不需要加载外部字体或图标。
-
-## 签到与积分
-
-“签到领积分”先向账号所属官网查询今日状态，未签到时提交实际的每日签到请求。今日已签到会直接显示完成；上游返回错误时显示失败，不会把访问成长中心视为领取成功。国际版和企业账号跳过每日签到。
-
-**对"已签到"的判定**（与同类项目对齐实测口径）：上游用业务码表示"今天已经签过"，
-本项目把 `10001`（hub 实测）与 `14001`（panel 实测）都按"已签到"处理，而不是显示失败。
-另外，上游偶发的 `HTTP 500 / code 10000` 抖动会做**有界重试**（最多 3 次、共 1.5s/3s 间隔）；
-`11101` 之类的参数错误以及"今日已签到"**不重试**——重试只会原样再失败一次。
-网络层/解析层错误**绝不**当成"已签到"，否则停机补签遇到抖动会误记成功、账号当天实际没签到。
-
-开启“可用积分”卡片中的“每日自动签到”后，程序会检查所有已保存的国内版个人账号。按北京时间换日，成功后当日不重复提交，失败后间隔 30 分钟重试。开启开关后会立即唤醒检查；重启后会重新核对服务端状态。该功能需要 wb2api 保持运行。
-
-自动签到开关单独保存在数据目录的 `settings.json`，与 Windows 自启设置互不影响。
-
-积分请求使用与登录账号匹配的官网域，国内版优先读取资源汇总，必要时查询资源包明细；国际版使用其资源列表接口。余额兼容字符串精确值、零余额及嵌套响应，不会把套餐总量、已用量或错误码当作余额。查询失败会保留上次余额并标注错误和上次成功更新时间。手动签到成功后会刷新余额；到账情况以服务端返回为准。
-
-## wb2api 开机自启（Windows / Linux）
-
-### Windows
-
-在侧栏底部开启“wb2api 开机自启”（手机上位于顶部导航下方）。程序仅写入当前 Windows 用户的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `wb2api-lite` 项，不调用任务计划服务，也不需要提权。
-
-当前用户登录 Windows 后，该启动项会运行当前 Python 和本项目脚本，并保留监听地址、端口、数据目录及凭证路径。可用时使用 `pythonw.exe` 在后台运行。设置完成后请保留 Python 和项目原路径；移动项目后，在新位置关闭再开启自启。
-
-### Linux
-
-同一个开关在 Linux 上写入 **systemd 用户级单元**（`~/.config/systemd/user/wb2api-lite.service`），
-不需要 `sudo`，也不改动系统目录：
+客户端接入：
 
 ```bash
-python3 wb2api.py                 # 前台运行
-python3 wb2api.py --port 8788     # 换端口
+export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+export OPENAI_API_KEY=<控制台显示的访问密钥>
 ```
 
-- 开启后执行 `systemctl --user enable wb2api-lite.service`，可用 `systemctl --user status wb2api-lite` 查看状态。
-- **注销后仍要常驻**，需要执行一次 `loginctl enable-linger $USER`。程序不会替你改这项系统设置，只在提示里告诉你怎么做。
-- 没有 systemd 的环境（WSL、部分容器）会明确提示"不支持"，请改用 `tmux` / `nohup` / 容器编排自行常驻。
-- 与 Windows 一样，使用 `--api-key` 或 `WB_API_KEY` 启动时不允许开启自启（重启后密钥会变）。
-
-关闭开关会删除此启动项，重复关闭也会成功。此设置仅启动 wb2api 代理自身。
-
-## 常用参数
-
-```powershell
-python wb2api.py --port 8788
-python wb2api.py --data-dir .\data
-python wb2api.py --no-ui
-python wb2api.py --login --realm cn
-```
-
-| 参数                              | 说明                  |
-| ------------------------------- | ------------------- |
-| `--host`                        | 监听地址，默认 `127.0.0.1` |
-| `--port`                        | 监听端口，默认 `8787`      |
-| `--realm global` / `--realm cn` | 命令行登录版本             |
-| `--data-dir`                    | 状态文件目录              |
-| `--no-ui`                       | 关闭网页控制台和管理接口        |
+`ui.html` 需与 `wb2api.py` 放在同一目录；缺失时控制台只显示一个简易兜底页面。
 
 ## 接口
 
-| 方法与路径                       | 用途                               |
-| --------------------------- | -------------------------------- |
-| `POST /v1/chat/completions` | Chat Completions                 |
-| `POST /v1/responses`        | Responses                        |
-| `POST /v1/messages`         | Anthropic Messages（支持流式、图片和工具调用） |
-| `GET /v1/models`            | 当前可见模型                           |
-| `GET /healthz`              | 服务健康状态                           |
-| `GET /`                     | 中文网页控制台                          |
+| 方法与路径 | 说明 |
+| --- | --- |
+| `POST /v1/chat/completions` | OpenAI Chat Completions，流式 / 非流式 |
+| `POST /v1/responses` | OpenAI Responses（薄适配，转成上游对话请求） |
+| `POST /v1/messages` | Anthropic Messages，支持流式、图片和自定义工具 |
+| `GET /v1/models`、`GET /v1/models/{id}` | 当前可见模型 |
+| `GET /healthz` | 健康状态（含账号池状态） |
+| `GET /` | 网页控制台 |
 
-默认地址为 `http://127.0.0.1:8787/v1`，接口密钥在网页控制台显示。
+- 鉴权：`Authorization: Bearer <密钥>` 或 `x-api-key: <密钥>`。
+- 路径容错：少写 `/v1`（如 `/chat/completions`）、结尾斜杠、经 HTTP 代理发出的绝对 URL 请求行都能正确路由。
+- Anthropic SDK：`ANTHROPIC_BASE_URL=http://127.0.0.1:8787`，`ANTHROPIC_API_KEY=<密钥>`。不支持 Anthropic 服务端工具、PDF 内容块和 `/v1/messages/count_tokens`。
+- Responses 的 `previous_response_id` 历史只存在内存中：最多 256 条、保留 6 小时、总量 32 MiB，重启后无法续接。
 
-Anthropic SDK 接入时，将 `ANTHROPIC_BASE_URL` 设置为 `http://127.0.0.1:8787`（SDK 会自动请求 `/v1/messages`），将 `ANTHROPIC_API_KEY` 设置为网页控制台显示的本地访问密钥；也可以直接使用 `x-api-key` 请求头。代理会把 Anthropic Messages 请求转换为上游对话请求，再将响应转换回 Anthropic 格式。
+## 访问密钥
 
-模型填写控制台中已启用的实际模型 ID，沿用当前账户的模型选择、别名和默认模型配置。控制台“接入配置 → Anthropic”可生成包含 `ANTHROPIC_MODEL` 的配置；使用 Claude Code 时可合并到 `~/.claude/settings.json`。
+优先级：`--api-key` / `WB_API_KEY` > 数据目录的 `api_key.txt` > 首次启动自动生成并写入 `api_key.txt`。`--random-api-key` 每次启动生成一次性密钥，不读写文件。启动日志只显示掩码。
 
-当前支持文本、URL/Base64 图片、自定义工具及多轮工具结果。图片是否可用取决于所选上游模型。暂不提供 Anthropic 服务端工具、PDF 内容块、原生扩展思考签名和 `/v1/messages/count_tokens`；缓存控制标记不会启用原生 Anthropic 提示缓存。
+## 网页控制台
 
-Responses 的 `previous_response_id` 历史保存在内存中，最多 256 条、保留 6 小时，序列化历史总容量最多 32 MiB（不是进程总内存上限）。超过条数或容量时淘汰最早存入的历史，单条超过容量上限则不缓存。访问缓存及后台每 30 秒的维护会清理过期记录。重启、过期或淘汰后，相应 ID 无法续接，需要重新提供上下文。
+- 多账号保存与热切换，显示当前账号积分。
+- 模型管理：按倍率排序、搜索、勾选；勾选按账号保存。
+- 接入配置：复制接口地址和密钥，生成客户端配置。
+- 用量统计：今日 / 本月的请求数、错误数、词元和积分。
+- 国内版个人账号的手动签到与每日自动签到开关；开机自启开关。
 
-## Claude Code 使用说明
+管理接口都在 `/admin/*` 下。监听回环地址时免密，但会校验 `Host` 为回环名、`Origin` 同源；监听其他地址时必须带密钥，首次用 `http://<地址>:8787/?pwd=<密钥>` 打开，之后改用 HttpOnly cookie。`--no-ui` 会同时关闭控制台和全部管理接口。
 
-### 兼容性注意
+## 模型选择、别名与默认模型
 
-由于 WorkBuddy 的渠道校验策略，**Claude Code 使用 Anthropic Messages 接口（`/v1/messages`）可能遇到 `code=11128` 错误**。这是 WorkBuddy 在检测到非官方客户端身份特征后主动拒绝请求，与 wb2api 的格式转换无关。
-
-### 推荐方案：使用 OpenAI 接口
-
-**在 Claude Code 配置中使用 `/v1/chat/completions` 接口**（`~/.claude/settings.json`）：
-
-```json
-{
-  "openai": {
-    "baseURL": "http://127.0.0.1:8787/v1",
-    "apiKey": "wb-your-api-key",
-    "model": "claude-sonnet-4-20250514"
-  }
-}
-```
-
-或者配置为 Anthropic 提供商但使用 OpenAI 格式：
+`selection.json`（数据目录内，修改后自动热加载）支持：
 
 ```json
 {
-  "anthropic": {
-    "apiProvider": "openai",
-    "openai": {
-      "baseURL": "http://127.0.0.1:8787/v1",
-      "apiKey": "wb-your-api-key",
-      "model": "claude-sonnet-4-20250514"
-    }
-  }
+  "models": ["deepseek-v4.1-flash"],
+  "aliases": {"gpt-4o": "deepseek-v4.1-flash"},
+  "default_model": "deepseek-v4.1-flash",
+  "enforce": false
 }
 ```
 
-**要点**：
-- 使用 `/v1/chat/completions` 接口，wb2api 提供完整支持
-- `model` 填写控制台中已启用的实际模型 ID
-- `apiKey` 从网页控制台的"接入配置"中获取
+解析顺序：别名 → 原名 → 默认模型。`enforce: true` 时只放行已勾选的模型。未知模型名只在模型目录完整且该模型未被勾选时才回退到默认模型。控制台的勾选会写入同一个文件（按账号、按池分别保存）。
 
-### 技术背景
+## 账号池
 
-WorkBuddy 的渠道校验不仅检查 HTTP 请求头，还会分析 system prompt 内容。Claude Code 的默认 system prompt 包含身份标识（如 "You are Claude Code, Anthropic's official CLI"），会被检测为非官方客户端而拒绝。使用 OpenAI 接口可以避开这一检测机制。
+保存多个账号时，国际版与国内版各成一个池，**绝不跨池**。
 
-## 国际版出站身份（渠道校验）
+- **选号**：会话粘性命中 → 当前账号 → 池内其他可用账号。
+- **会话粘性**：请求带 `X-Session-Id`、`X-Conversation-Id`、`Session-Id` 或 `X-Claude-Code-Session` 之一时固定到同一账号，有效期 30 分钟（滑动续期）。
+- **换号**：在向客户端写出任何字节之前遇到 `401 / 402 / 403 / 429 / 5xx` 时换号重试，单请求最多换 3 次；`400 / 404` 不换号。每次换号前等待 `WB_POOL_SWITCH_DELAY`（默认 5 秒，随机 ±20%）。
+- 换号只影响当次请求用哪个账号，不改动控制台上的当前账号。
 
-上游会校验请求是否"像官方客户端发出的"，不通过时返回 `400 / code 11128`（`request illegal`，`displayTips` 提示"这次调用没通过渠道校验，可能不是官方客户端发出的"）或 `403 / code 11140`（可能需要更新客户端版本）。2026-10-19 起该校验对国际版明显收紧，只补 `system` 首条消息已不足以通过。
+| 情况 | 处置 |
+| --- | --- |
+| `429` 限流 | 软冷却，600 秒起指数退避，封顶 2 小时 |
+| `403` 且错误含 `code=11140`（账号被限制） | 标记为禁用，本进程内不再参与轮询 |
+| 其他 `401 / 403` | 冷却 600 秒 |
+| `402` 余额不足 | 冷却 1 小时 |
+| `5xx` 连续 3 次 | 熔断 30 分钟 |
 
-代理按对 WorkBuddy 5.8.4 的抓包对齐了国际版出站身份，主要包括：
+冷却和禁用状态只保存在内存里，**重启后会恢复参与轮询**。被封禁的账号应从控制台或 `accounts.json` 中移除。状态可在 `GET /healthz` 的 `pool` 字段或 `GET /admin/pool` 查看。
 
-- 版本与 UA：`X-IDE-Version: 5.8.4`，UA `WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`。
-- 身份头：`X-Product: SaaS`、`X-Agent-Type: main`、`X-Agent-Intent: craft`、`X-Private-Data: true`。
-- 会话头族：`X-Conversation-ID`（带连字符 UUID，每请求现生成）、`X-Conversation-Request-ID` 与 `X-Root-Request-ID` 同值、`X-Conversation-Message-ID` 与 `X-Request-ID` 同值，后四者为 32 位 hex。
-- 链路头族：`X-Trace-ID`、`traceparent`、`b3`、`X-B3-TraceId`、`X-B3-SpanId`、`X-B3-Sampled`。
-- 对话请求不再发送 `X-Machine-ID` / `X-Session-ID`：官方只在反馈上报里发，恒定的派生值反而是网关特征。
-- 国际版不发送 `stream_options`（上游不认，国内版仍依赖它取 usage）。
+## 出站身份
 
-### 自动版本跟踪
+代理按官方桌面客户端的请求形态构造上游请求头，主要包括：
 
-**从 v2.5.0 起，程序会自动跟踪最新的客户端版本**，无需手动更新配置。版本信息会缓存 24 小时，启动时自动加载。
+- UA `WorkBuddy/<版本> workbuddy-ai/<版本> CLI/<CLI 版本>`（国际版）与 `X-IDE-Version`。
+- 国际版身份头：`X-Product: SaaS`、`X-Agent-Type: main`、`X-Agent-Intent: craft`、`X-Private-Data: true`。
+- 每个请求现生成的会话头（`X-Conversation-ID` 等）和链路头（`traceparent`、`b3`、`X-B3-*`、`X-Trace-ID`）。
+- 对话请求不带 `X-Machine-ID` / `X-Session-ID`；计费类请求带按账号 UID 稳定派生的 UUID 形状标识。
 
-如果需要手动控制版本：
+### 客户端版本
+
+版本取值优先级：环境变量 > 数据目录的 `client_versions.json` 缓存（24 小时有效）> 在线获取 > 内置默认值（`5.8.4` / CLI `2.161.0`）。
+
+在线获取会尝试解析 `www.workbuddy.ai/download`、`www.codebuddy.cn/download` 页面中的版本号以及 `/api/version` 接口；这些来源并非官方公开的版本接口，解析失败时回退默认值。服务运行期间有后台线程每 24 小时重新获取一次（`WB_VERSION_AUTO_REFRESH=0` 关闭）。
 
 ```bash
-# 查看当前版本
-python wb2api.py --show-version
-
-# 手动更新版本缓存
-python wb2api.py --update-version
-
-# 使用环境变量覆盖（优先级最高）
-export WB_CLIENT_VERSION="5.9.0"
-export WB_CLI_VERSION="2.165.0"
-export WB_INTL_CLIENT_VERSION="5.9.0"
-export WB_INTL_CLI_VERSION="2.165.0"
+python wb2api.py --show-version     # 查看当前版本
+python wb2api.py --update-version   # 立即重新获取并写入缓存
 ```
 
-版本缓存文件保存在数据目录的 `client_versions.json`。如果自动获取失败，会使用内置的默认版本（国内版和国际版均为 5.8.4 / CLI 2.161.0）。
+需要固定版本时用环境变量：`WB_CLIENT_VERSION`、`WB_CLI_VERSION`（国内版），`WB_INTL_CLIENT_VERSION`、`WB_INTL_CLI_VERSION`（国际版）。
 
-**更多关于客户端指纹模拟与反检测机制，请参阅 [FINGERPRINT.md](FINGERPRINT.md)**。
+### 指纹随机化（`WB_FINGERPRINT_ENABLED`，默认开启）
 
-**设备/会话标识按账号稳定派生**（技术路线参考同类项目
-[workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub) 的 `wb_fingerprint.derive_id`）：
-计费/上报类请求携带的 `X-Machine-ID`、`X-Session-ID` 现在输出**带连字符的 UUIDv4 形状**，
-而不是以前 36 位无连字符的裸 hex——裸 hex 是上游见不到的形态，本身就是一处网关特征。
+- 每次发往上游的请求前随机等待 0 到 `WB_FINGERPRINT_JITTER` 秒（默认 0.2）。
+- UA 中的客户端版本修订号随机 ±1（如 `5.8.4` 可能变成 `5.8.3` 或 `5.8.5`）。注意 `X-IDE-Version` 不做此随机，两者可能不一致；如需保持一致，设 `WB_FINGERPRINT_ENABLED=0`。
 
-取值仍**按账号 UID 派生**（同一账号跨重启恒定、不同账号互异），而不是像官方客户端那样
-按进程取一个随机值：本程序是一个长驻进程同时代表多个账号，若按进程取值，所有账号会共用
-同一个 `machineId`，反而把它们关联到同一台机器上。身份模块的回归测试在 `tests/test_identity.py`。
+### system 消息处理
 
-国内版没有对应抓包且当前正常，出站身份维持原样。若上游再次调整，优先核对官方客户端版本与抓包字段，再改这里。
+上游要求首条消息为 system，客户端没带时补 `WB_DEFAULT_SYSTEM`（默认 `You are a helpful assistant.`）。`developer` 角色会改写为 `system`。之后按以下开关处理 system 消息：
 
-## 离线回归测试
+| 环境变量 | 默认 | 行为 |
+| --- | --- | --- |
+| `WB_LIMIT_SYSTEM_LENGTH` | `1` | 超过 `WB_MAX_SYSTEM_LENGTH` 字节的 system 消息被截断并追加 `...` |
+| `WB_MAX_SYSTEM_LENGTH` | `500` | 上述截断阈值（字节） |
+| `WB_SYSTEM_TO_USER` | `0` | 首条 system 超长时改为 user 消息，前面补一条默认 system（优先于截断） |
+| `WB_REMOVE_SYSTEM` | `0` | 删除全部 system 消息，只保留一条内容为 `OK` 的 system |
 
-测试使用模拟账户和上游事件流，不访问真实账户、上游服务或 Windows 自启设置。
+**默认开启的截断会影响 Agent 类客户端**：Codex、Claude Code 等的 system 提示词通常远超 500 字节，截断后工具定义、行为约束会丢失。这类客户端建议设 `WB_LIMIT_SYSTEM_LENGTH=0`，或改用 `WB_SYSTEM_TO_USER=1`。
 
-```powershell
-python -B -m unittest discover -s tests -v
-node tests/check_ui.cjs
-```
+## 错误提示
 
-Python 测试覆盖 Anthropic 转换、OpenAI 请求体归一、HTTP 路由与鉴权、请求正文边界、凭证与账号库读写、积分解析、模型勾选竞态、模型目录缓存合并、Responses 协议收尾、用量文件抗损坏、日志脱敏、国际版出站身份（会话头族、ID 形态、5.8.4 版本/UA 与国内版不受影响）、**账号池（双池隔离、换号、会话粘性、冷却熔断、端到端 failover）**、**跨平台自启（Linux systemd 单元生成与开关）**、**身份标识形态** 和 **每日签到（已签到码、瞬时重试、状态预检查）**。Node.js 检查验证网页脚本语法、无外链资源、DOM 引用完整性，以及配置生成（Anthropic 使用根地址、实际模型 ID 及访问密钥，Codex 使用 Responses 接口）；不包含浏览器布局测试。
+- `403` 且含 `code=11140`：响应里带“异常 / 封禁 / 限制”字样时提示账号已被限制使用；账号池会把该账号移出轮询。
+- `--debug` 下会打印发往上游的请求头（不含 `Authorization`）和上游错误响应的原始内容（前 500 字符），不打印对话正文。
 
-当前共 **272 项 Python 测试**。
+## 签到与积分
 
-## 已知限制
+- 国内版个人账号支持“签到领积分”；国际版和企业账号跳过签到。
+- 上游业务码 `10001`、`14001` 视为“今日已签到”。
+- 每日自动签到开启后遍历所有国内版个人账号，按北京时间换日，失败后 30 分钟再试。开关保存在 `settings.json`，需要程序保持运行。
 
-这些是当前版本有意保留的行为，不是缺陷：
+## 开机自启
 
-- **Claude Code 与 Anthropic Messages**：由于 WorkBuddy 的渠道校验策略，Claude Code 使用 `/v1/messages` 接口可能遇到 `code=11128` 错误。推荐使用 `/v1/chat/completions` 接口（OpenAI 格式），wb2api 对该接口提供完整支持。详见"Claude Code 使用说明"章节。
-- **Responses 端点**：不支持的内容块（`input_file`、`input_audio`、`file_id` 图片、`item_reference`）会被忽略而不是报错；模型拒答（refusal）不会转成 `refusal` 内容块；`finish_reason=length` 时 `response.status` 为 `incomplete`，但 `item.status` 仍是 `completed`。
-- **流式与非流式差异**：`model` 字段来源不同（非流式优先用上游回显，流式用请求值），`parallel_tool_calls` 只在非流式响应里出现。
-- **默认模型回退**：只有当模型目录完整（三路 `/v3/config` 全部成功）且该模型未被勾选时，未知模型名才会回退到默认模型。目录残缺时宁可让上游返回错误，也不静默换模型。
-- **模型目录**：部分路由失败时与上次缓存取并集，因此上游已下线的模型可能多保留一段时间。
-- **用量统计**：`usage.jsonl` 只回放尾部 4MB；跨午夜并发记录存在极窄的归日竞态；多账号共用同一份汇总，不按账号分组。
-- **启动日志中的访问密钥只显示掩码**；`--setup` 向导会为了让你复制而打印完整密钥。
+控制台里的开关：
+
+- **Windows**：写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `wb2api-lite` 项，无需管理员权限；可用时用 `pythonw.exe` 后台运行。移动项目目录后需重新开关一次。
+- **Linux**：写入 systemd 用户单元 `~/.config/systemd/user/wb2api-lite.service`。注销后仍要运行需自行执行 `loginctl enable-linger $USER`；无 systemd 的环境（WSL、容器）不支持。
+
+用 `--api-key` 或 `WB_API_KEY` 启动时不允许开启自启（重启后密钥会丢失）。
+
+## 命令行参数
+
+| 参数 | 说明 |
+| --- | --- |
+| `--host` | 监听地址，默认 `127.0.0.1`（`WB_HOST`） |
+| `--port` | 监听端口，默认 `8787`（`WB_PORT`） |
+| `--data-dir` | 状态文件目录，默认脚本所在目录（`WB_DATA_DIR`） |
+| `--auth` | 凭证文件路径，默认 `<data-dir>/auth.json` |
+| `--api-key` / `--random-api-key` | 指定 / 一次性生成访问密钥 |
+| `--setup` / `--relogin` | 终端向导：登录 → 选模型 → 打印接入信息；`--relogin` 强制重新登录 |
+| `--login --realm global\|cn` | 命令行设备授权登录后退出 |
+| `--list-models` | 打印各探测路的模型目录后退出 |
+| `--show-version` / `--update-version` | 查看 / 重新获取客户端版本后退出 |
+| `--no-ui` | 关闭网页控制台和管理接口 |
+| `--hide-reasoning` | 不向客户端输出 `reasoning_content` |
+| `--debug` | 打印上游请求元数据与前几帧 SSE（`WB_DEBUG=1`） |
+
+## 环境变量
+
+上文已列出的版本、指纹、system 相关变量之外：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `WB_UPSTREAM_BASE` | 按账号区域 | 强制所有请求走指定上游 |
+| `WB_MAX_INFLIGHT` | `8` | 同时在途的对话请求上限，超出返回 429 |
+| `WB_MAX_BODY` | 16 MiB | 请求体上限（1–256 MiB） |
+| `WB_CLIENT_TIMEOUT` | `120` | 下游连接空闲超时（秒，30–3600） |
+| `WB_DRAIN_BODY_MAX` | 1 MiB | chunked 请求体排空上限 |
+| `WB_POOL_IDLE_TTL` | `40` | 上游连接池空闲超时（秒，10–120） |
+| `WB_GZIP_MIN` | `16384` | 请求体超过该字节数时 gzip 后发上游，`0` 关闭 |
+| `WB_GZIP_DISABLE_TTL` | `1800` | 上游拒绝 gzip 后的禁用时长（秒），`0` 为永久 |
+| `WB_POOL` | `1` | `0` 关闭账号池 |
+| `WB_POOL_SOFT_COOLDOWN` / `WB_POOL_SOFT_MAX` | `600` / `7200` | 429 冷却起点 / 上限（秒） |
+| `WB_POOL_HARD_COOLDOWN` | `0` | 402 冷却时长，`0` 表示 3600 秒 |
+| `WB_POOL_FAIL_THRESHOLD` / `WB_POOL_BREAKER` | `3` / `1800` | 5xx 熔断阈值 / 熔断时长（秒） |
+| `WB_POOL_STICKY_TTL` / `WB_POOL_STICKY_MAX` | `1800` / `4096` | 会话粘性有效期（秒）/ 最大条数 |
+| `WB_POOL_MAX_SWITCH` | `3` | 单请求最多换号次数 |
+| `WB_POOL_SWITCH_DELAY` | `5.0` | 换号前等待（秒，随机 ±20%） |
+| `WB_IDE_UA` / `WB_CLI_UA` | 内置 | 模型目录探测用的另外两种 UA |
+| `WB_AUTH_FILE`、`WB_ACCOUNTS_FILE`、`WB_API_KEY_FILE`、`WB_SELECTION_FILE`、`WB_SETTINGS_FILE`、`WB_USAGE_FILE`、`WB_MODELS_CACHE_FILE` | 数据目录内 | 单独指定各状态文件路径 |
 
 ## 本地状态文件
 
-运行时可能产生 `accounts.json`、`auth.json`、`api_key.txt`、`selection.json`、`models_cache.json`、`usage.jsonl` 和 `settings.json`。这些文件包含本机账号、令牌、密钥、历史数据或个人设置，不应提交或分享。要恢复未登录状态，停止程序后删除这些运行时文件。
+运行时会在数据目录生成：`accounts.json`、`auth.json`、`api_key.txt`、`selection.json`、`settings.json`、`models_cache.json`、`usage.jsonl`、`client_versions.json`。前三个含账号令牌和访问密钥，**不要提交或分享**。仓库当前没有 `.gitignore`，提交前请确认这些文件未被加入。
 
-签到和积分接口参考以下项目核对，并结合本项目的账号隔离与令牌刷新机制实现：
-
-- [ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)：`wb_accounts.py`
-- [changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)：`checkin.rs`、`credits.rs`、`variant.rs`
+停止程序后删除这些文件即可恢复到未登录状态。
