@@ -194,6 +194,7 @@ _models_cache: dict = {"at": 0.0, "data": None, "owner": None}
 _catalogs: dict[str, dict] = {}
 _selection: list[str] = []          # 用户勾选的模型子集；空 = 不过滤
 _account_selections: dict[str, list[str]] = {}
+_account_use_own_models: dict[str, bool] = {}  # 账户级模型开关：{"accountId": True/False}
 _pool_selections: dict[str, list[str]] = {}  # 池级别模型配置：{"cn": [...], "global": [...]}
 _pool_aliases: dict[str, dict[str, str]] = {}  # 池级别别名：{"cn": {...}, "global": {...}}
 _selection_owner = ""
@@ -1054,7 +1055,8 @@ def activate_account(a: dict) -> dict:
             # 先将旧全局勾选归属原账号，避免切换后重启把旧勾选迁移给新账号。
             if not _selection_scoped and os.path.exists(SELECTION_FILE):
                 payload = {"models": list(_selection), "accounts": profiles, "activeAccountId": owner,
-                           "aliases": dict(_aliases), "default_model": _default_model, "enforce": _enforce}
+                           "aliases": dict(_aliases), "default_model": _default_model, "enforce": _enforce,
+                           "accountUseOwnModels": dict(_account_use_own_models)}
                 _write_private(SELECTION_FILE, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
                 _selection_mtime = os.path.getmtime(SELECTION_FILE)
                 _selection_scoped = True
@@ -4062,7 +4064,7 @@ def load_selection() -> None:
     """仅在完整读取有效配置后更新内存，编辑中的无效文件不会解除模型限制。"""
     global _selection, _aliases, _default_model, _enforce, _selection_mtime
     global _account_selections, _selection_owner, _selection_scoped
-    global _pool_selections, _pool_aliases
+    global _pool_selections, _pool_aliases, _account_use_own_models
     with _lock, _selection_lock:
         try:
             mt = os.path.getmtime(SELECTION_FILE)
@@ -4104,12 +4106,16 @@ def load_selection() -> None:
                                           for k, v in pool_aliases_val.items()
                                           if k.strip() and v.strip()}
 
-            profiles = raw.get("accounts", )
+            profiles = raw.get("accounts", {})
             owner = raw.get("activeAccountId", "")
+            use_own_models = raw.get("accountUseOwnModels", {})
             if not isinstance(owner, str) or not isinstance(profiles, dict) or any(
                     not isinstance(key, str) or not key or not isinstance(value, list) or
                     any(not isinstance(i, str) for i in value) for key, value in profiles.items()):
                 raise ValueError("账号模型勾选配置格式不正确")
+            if not isinstance(use_own_models, dict) or any(
+                    not isinstance(k, str) or not k or not isinstance(v, bool) for k, v in use_own_models.items()):
+                raise ValueError("账户级模型开关配置格式不正确")
         except FileNotFoundError:
             return
         except (OSError, ValueError) as e:
@@ -4133,7 +4139,7 @@ def load_selection() -> None:
             _selection = list(profiles[active])
         elif _auth and pools:
             # 账号没有配置，使用池级别配置
-            realm = _realm(_auth.get("base", ""))
+            realm = _pool_realm(_auth)
             _selection = list(pool_selections.get(realm, []))
         else:
             # 使用全局配置
@@ -4141,11 +4147,12 @@ def load_selection() -> None:
 
         _account_selections, _selection_owner, _selection_scoped = profiles, active, scoped
         _pool_selections, _pool_aliases = pool_selections, pool_aliases_map
+        _account_use_own_models = use_own_models
 
         # 合并别名：池级别别名 + 全局别名（全局优先）
         merged_aliases = {}
         if _auth and pools:
-            realm = _realm(_auth.get("base", ""))
+            realm = _pool_realm(_auth)
             merged_aliases = dict(pool_aliases_map.get(realm, {}))
         merged_aliases.update({k.strip(): v.strip() for k, v in al.items() if k.strip() and v.strip()})
 
@@ -4207,19 +4214,30 @@ def _mask_api_key(key: str) -> str:
 
 
 def selection_for_account(a: dict) -> list[str]:
-    """以请求捕获的账号读取勾选，切换账号不影响在途请求。"""
+    """以请求捕获的账号读取勾选，切换账号不影响在途请求。
+    优先级：账户级模型（如果启用）> 池级别模型 > 空（不过滤）。
+    """
     with _lock, _selection_lock:
         aid = account_id(a)
-        if _auth and account_id(_auth) == aid:
-            return list(_selection)
-        return list(_account_selections.get(aid, []))
+        realm = _pool_realm(a)  # 使用推导函数而非直接读取，避免空串问题
+
+        # 检查该账户是否启用账户级模型
+        # 默认 True：旧配置缺失该键时应使用账户级模型（向后兼容）
+        if _account_use_own_models.get(aid, True):
+            # 启用账户级：如果是当前账户用 _selection，否则用该账户保存的选择
+            if _auth and account_id(_auth) == aid:
+                return list(_selection)
+            return list(_account_selections.get(aid, []))
+
+        # 未启用账户级，使用池级别
+        return list(_pool_selections.get(realm, []))
 
 
 def save_selection(ids: list | None = None, **extra) -> dict:
     """串行保存配置；落盘成功后才更新内存，部分更新不会覆盖并发修改。"""
     global _selection, _aliases, _default_model, _enforce, _selection_mtime
     global _account_selections, _selection_owner, _selection_scoped
-    global _pool_selections, _pool_aliases
+    global _pool_selections, _pool_aliases, _account_use_own_models
     with _lock, _selection_lock:
         aid = account_id(_auth) if _auth else ""
         if extra.get("expected_account_id") is not None and extra["expected_account_id"] != aid:
@@ -4248,6 +4266,12 @@ def save_selection(ids: list | None = None, **extra) -> dict:
                     pool_alias[realm] = {k.strip(): v.strip() for k, v in als.items()
                                         if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()}
 
+        # 处理账户级模型开关
+        use_own_models = dict(_account_use_own_models)
+        if isinstance(extra.get("useAccountModels"), bool):
+            if aid:
+                use_own_models[aid] = extra["useAccountModels"]
+
         payload = {"models": selected, "aliases": aliases, "default_model": default, "enforce": enforce}
 
         # 添加池配置到 payload
@@ -4265,23 +4289,25 @@ def save_selection(ids: list | None = None, **extra) -> dict:
         profiles = {key: list(value) for key, value in _account_selections.items()}
         if aid:
             profiles[aid] = list(selected)
-        payload.update(accounts=profiles, activeAccountId=aid)
+        payload.update(accounts=profiles, activeAccountId=aid, accountUseOwnModels=use_own_models)
         _write_private(SELECTION_FILE, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         _selection, _aliases, _default_model, _enforce = selected, aliases, default, enforce
         _account_selections, _selection_owner, _selection_scoped = profiles, aid, True
         _pool_selections, _pool_aliases = pool_models, pool_alias
+        _account_use_own_models = use_own_models
         _selection_mtime = os.path.getmtime(SELECTION_FILE)
         return {"ok": True, "accountId": aid, "selected": list(selected), "aliases": dict(aliases),
                 "defaultModel": default, "enforce": enforce,
                 "poolModels": {realm: list(models) for realm, models in pool_models.items()},
-                "poolAliases": {realm: dict(als) for realm, als in pool_alias.items()}}
+                "poolAliases": {realm: dict(als) for realm, als in pool_alias.items()},
+                "useAccountModels": use_own_models.get(aid, False)}
 
 
 # ---------------------------------------------------------------------------
 # 用量记录：每个请求一行 usage.jsonl，控制台据此估算积分消耗
 # ---------------------------------------------------------------------------
 _usage_lock = threading.Lock()
-_usage_tot: dict = {"day": "", "today": {}, "month": "", "this_month": {}}
+_usage_tot: dict = {"day": "", "today": {}, "month": "", "this_month": {}, "by_account": {}, "by_account_period": {}}
 
 
 def _credit_factor(model: str, account: dict | None = None) -> float | None:
@@ -4334,6 +4360,62 @@ def _bump(bucket: dict, rec: dict) -> None:
         m["weighted_k"] = round(m.get("weighted_k", 0.0) + factor * (tokens_in + tokens_out) / 1000, 3)
 
 
+def _bump_account(bucket: dict, rec: dict) -> None:
+    """按账户聚合用量（只统计总量，不分模型）。"""
+    aid = rec.get("accountId")
+    if not isinstance(aid, str) or not aid:
+        aid = "(未知账户)"
+    m = bucket.setdefault(aid, {"requests": 0, "errors": 0, "input_tokens": 0,
+                                "output_tokens": 0, "weighted_k": 0.0, "credits": 0.0})
+    m["requests"] += 1
+    if to_int(rec.get("status")) >= 400:
+        m["errors"] += 1
+    tokens_in, tokens_out = to_int(rec.get("in")), to_int(rec.get("out"))
+    m["input_tokens"] += tokens_in
+    m["output_tokens"] += tokens_out
+    credit = rec.get("credit")
+    if isinstance(credit, (int, float)) and not isinstance(credit, bool):
+        m["credits"] = round(m.get("credits", 0.0) + credit, 4)
+    factor = rec.get("factor")
+    if isinstance(factor, (int, float)) and not isinstance(factor, bool):
+        m["weighted_k"] = round(m.get("weighted_k", 0.0) + factor * (tokens_in + tokens_out) / 1000, 3)
+
+
+def _bump_account_period_model(bucket: dict, rec: dict, period: str) -> None:
+    """按账户 → 时间周期 → 模型的三级结构聚合用量。"""
+    aid = rec.get("accountId")
+    aname = rec.get("accountName", "")
+    if not isinstance(aid, str) or not aid:
+        aid = "(未知账户)"
+        aname = "(未知账户)"
+
+    account_bucket = bucket.setdefault(aid, {"name": aname, "today": {}, "this_month": {}})
+    if "name" not in account_bucket or not account_bucket["name"]:
+        account_bucket["name"] = aname
+
+    period_bucket = account_bucket.setdefault(period, {})
+
+    model = rec.get("model")
+    if not isinstance(model, str):
+        model = ""
+
+    m = period_bucket.setdefault(model, {"requests": 0, "errors": 0, "input_tokens": 0,
+                                         "output_tokens": 0, "weighted_k": 0.0, "credits": 0.0})
+    m["requests"] += 1
+    if to_int(rec.get("status")) >= 400:
+        m["errors"] += 1
+    tokens_in, tokens_out = to_int(rec.get("in")), to_int(rec.get("out"))
+    m["input_tokens"] += tokens_in
+    m["output_tokens"] += tokens_out
+    credit = rec.get("credit")
+    if isinstance(credit, (int, float)) and not isinstance(credit, bool):
+        m["credits"] = round(m.get("credits", 0.0) + credit, 4)
+    factor = rec.get("factor")
+    if isinstance(factor, (int, float)) and not isinstance(factor, bool):
+        m["weighted_k"] = round(m.get("weighted_k", 0.0) + factor * (tokens_in + tokens_out) / 1000, 3)
+
+
+
 def record_usage(path: str, model: str, status: int, usage: dict | None, secs: float,
                  ttft: float | None, stream: bool, error: str = "", account: dict | None = None) -> None:
     u = usage if isinstance(usage, dict) else {}
@@ -4364,6 +4446,9 @@ def record_usage(path: str, model: str, status: int, usage: dict | None, secs: f
         _roll_usage(day, month)
         _bump(_usage_tot["today"], rec)
         _bump(_usage_tot["this_month"], rec)
+        _bump_account(_usage_tot["by_account"], rec)
+        _bump_account_period_model(_usage_tot["by_account_period"], rec, "today")
+        _bump_account_period_model(_usage_tot["by_account_period"], rec, "this_month")
         try:
             f = _usage_fh()
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -4403,16 +4488,26 @@ def _usage_fh():
 
 def _roll_usage(day: str, month: str) -> None:
     if _usage_tot["day"] != day:
-        _usage_tot.update(day=day, today={})
+        _usage_tot.update(day=day, today={}, by_account={})
+        # 重置 by_account_period 的 today
+        for aid in list(_usage_tot.get("by_account_period", {}).keys()):
+            if aid in _usage_tot["by_account_period"]:
+                _usage_tot["by_account_period"][aid]["today"] = {}
     if _usage_tot["month"] != month:
         _usage_tot.update(month=month, this_month={})
+        # 重置 by_account_period 的 this_month
+        for aid in list(_usage_tot.get("by_account_period", {}).keys()):
+            if aid in _usage_tot["by_account_period"]:
+                _usage_tot["by_account_period"][aid]["this_month"] = {}
+
+
 
 
 def load_usage_totals() -> None:
     """启动时从 usage.jsonl 回放本月数据（只读尾部 4MB，足够覆盖一个月的个人用量）。"""
     day, month = time.strftime("%Y-%m-%d"), time.strftime("%Y-%m")
     with _usage_lock:
-        _usage_tot.update(day=day, today={}, month=month, this_month={})
+        _usage_tot.update(day=day, today={}, month=month, this_month={}, by_account={}, by_account_period={})
         try:
             size = os.path.getsize(USAGE_FILE)
             with open(USAGE_FILE, "rb") as f:
@@ -4435,10 +4530,14 @@ def load_usage_totals() -> None:
                 if time.strftime("%Y-%m", t) != month:
                     continue
                 _bump(_usage_tot["this_month"], rec)
+                _bump_account_period_model(_usage_tot["by_account_period"], rec, "this_month")
                 if time.strftime("%Y-%m-%d", t) == day:
                     _bump(_usage_tot["today"], rec)
+                    _bump_account(_usage_tot["by_account"], rec)
+                    _bump_account_period_model(_usage_tot["by_account_period"], rec, "today")
             except Exception:  # noqa: BLE001 - 单行损坏不影响其余统计
                 continue
+
 
 
 def usage_summary() -> dict:
@@ -4447,7 +4546,10 @@ def usage_summary() -> dict:
         _roll_usage(day, month)
         return json.loads(json.dumps({"today": _usage_tot["today"],
                                       "month": _usage_tot["this_month"],
+                                      "by_account": _usage_tot["by_account"],
+                                      "by_account_period": _usage_tot["by_account_period"],
                                       "day": day, "monthName": month}))
+
 
 
 # ===========================================================================
@@ -4494,7 +4596,7 @@ def _console_cookie() -> str:
 
 
 def admin_state() -> dict:
-    """网页首屏所需的全部状态（不含模型列表，模型走单独接口）。"""
+    """网页首屏所需的全部状态（不含模型列表,模型走单独接口）。"""
     with _lock, _selection_lock:
         a = _auth
         accounts = dict(_accounts)
@@ -4505,6 +4607,7 @@ def admin_state() -> dict:
         aliases, default_model, enforce = dict(_aliases), _default_model, _enforce
         pool_models = {realm: list(models) for realm, models in _pool_selections.items()}
         pool_alias = {realm: dict(als) for realm, als in _pool_aliases.items()}
+        use_account_models = _account_use_own_models.get(account_id(a) if a else "", False)
     logged_in = bool(a and a.get("accessToken"))
     host = "127.0.0.1" if _is_loopback(_BIND_HOST) or _BIND_HOST in ("0.0.0.0", "::") \
         else _BIND_HOST
@@ -4524,6 +4627,7 @@ def admin_state() -> dict:
         "enforce": enforce,
         "poolModels": pool_models,
         "poolAliases": pool_alias,
+        "useAccountModels": use_account_models,
         "modelsCached": bool(_models_cache["data"]),
         "usage": usage_summary(),
     }
@@ -5073,6 +5177,21 @@ class Handler(BaseHTTPRequestHandler):
                 if "aliases" in body and any(not isinstance(v, str) or not k.strip() or not v.strip()
                                               for k, v in body["aliases"].items()):
                     return self._error(400, "别名和目标模型都必须是非空字符串", "invalid_request_error")
+
+                # 如果提供了 poolRealm，表示保存池级配置
+                pool_realm = body.get("poolRealm")
+                if pool_realm is not None:
+                    if not isinstance(pool_realm, str) or pool_realm not in REALMS:
+                        return self._error(400, "poolRealm 必须是有效的池名称", "invalid_request_error")
+                    try:
+                        saved = save_selection(poolModels={pool_realm: ids or []})
+                    except (ValueError, RuntimeError) as e:
+                        return self._error(409, str(e), "invalid_request_error")
+                    except OSError as e:
+                        return self._error(500, "保存配置失败：%s" % e)
+                    log("池 %s 的模型选择已更新：%d 个" % (pool_realm, len(ids or [])))
+                    return self._json(200, saved)
+
                 try:
                     saved = save_selection(ids, aliases=body.get("aliases"),
                                    default_model=body.get("default_model"),
@@ -5085,6 +5204,25 @@ class Handler(BaseHTTPRequestHandler):
                     len(_selection), "，别名 %d 个" % len(_aliases) if _aliases else "",
                     "，默认 " + _default_model if _default_model else ""))
                 return self._json(200, saved)
+            if path == "/admin/toggle-account-models":
+                try:
+                    a = ensure_auth()
+                except Exception as e:
+                    return self._error(400, str(e))
+                use_account = body.get("useAccountModels")
+                if not isinstance(use_account, bool):
+                    return self._error(400, "useAccountModels 必须是布尔值", "invalid_request_error")
+                aid = account_id(a)
+                try:
+                    saved = save_selection(useAccountModels=use_account)
+                    # 返回实际生效的选择（可能因为池级为空而与用户勾选的不同）
+                    selected = list(selection_for_account(a))
+                except (ValueError, RuntimeError) as e:
+                    return self._error(409, str(e), "invalid_request_error")
+                except OSError as e:
+                    return self._error(500, "保存配置失败：%s" % e)
+                log("账户 %s 已%s账户级模型" % (account_name(a) or aid, "启用" if use_account else "禁用"))
+                return self._json(200, {"ok": True, "useAccountModels": use_account, "selected": selected})
             if path == "/admin/models/refresh":
                 try:
                     a = ensure_auth()
