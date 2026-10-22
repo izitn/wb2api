@@ -81,7 +81,7 @@ python wb2api.py
 
 所有参数都能用环境变量调整：`WB_POOL`（`0` 关闭账号池）、`WB_POOL_SOFT_COOLDOWN`、
 `WB_POOL_SOFT_MAX`、`WB_POOL_HARD_COOLDOWN`、`WB_POOL_FAIL_THRESHOLD`、`WB_POOL_BREAKER`、
-`WB_POOL_STICKY_TTL`、`WB_POOL_MAX_SWITCH`。
+`WB_POOL_STICKY_TTL`、`WB_POOL_MAX_SWITCH`、`WB_POOL_SWITCH_DELAY`（账号切换延时，默认 5 秒）。
 
 ### 其他可配置参数
 
@@ -90,17 +90,35 @@ python wb2api.py
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `WB_MAX_BODY` | `16777216` (16MB) | 请求体大小上限（字节），最小 1MB，最大 256MB |
+| `WB_MAX_INFLIGHT` | `8` | 同时在途的对话请求上限（降低以避免触发风控） |
 | `WB_CLIENT_TIMEOUT` | `120` | 下游连接空闲超时（秒），范围 30-3600 |
 | `WB_DRAIN_BODY_MAX` | `1048576` (1MB) | chunked 请求体排空上限（字节） |
 | `WB_POOL_IDLE_TTL` | `40` | 连接池空闲超时（秒），范围 10-120 |
 | `WB_GZIP_MIN` | `16384` (16KB) | gzip 压缩阈值（字节），`0` 禁用压缩 |
 | `WB_GZIP_DISABLE_TTL` | `1800` (30分钟) | gzip 被拒后禁用时长（秒），`0` 永久禁用 |
+| `WB_POOL_SWITCH_DELAY` | `5.0` | 账号切换后的延时（秒），避免过快触发风控 |
+
+**风控相关配置**（2026-10 腾讯加强了对 system 消息的内容审核）：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `WB_LIMIT_SYSTEM_LENGTH` | `1` | 是否限制 system 消息长度（`1` 启用，`0` 禁用） |
+| `WB_MAX_SYSTEM_LENGTH` | `500` | system 消息最大长度（字节），超出部分将被截断 |
+| `WB_REMOVE_SYSTEM` | `0` | 是否完全移除 system 消息（`1` 启用，可能影响对话质量） |
+| `WB_SYSTEM_TO_USER` | `0` | 是否将过长的 system 转为首条 user 消息（`1` 启用） |
+| `WB_DEFAULT_SYSTEM` | `You are a helpful assistant.` | 默认的 system 消息内容 |
 
 **常见场景**：
 
 - **长上下文对话遇到 413 错误**：提高 `WB_MAX_BODY` 到 `67108864`（64MB）或更高
 - **网络不稳定**：延长 `WB_CLIENT_TIMEOUT` 到 `180` 或 `300`
 - **高并发场景**：延长 `WB_POOL_IDLE_TTL` 到 `60`，增加连接复用率
+- **触发风控**：降低 `WB_MAX_INFLIGHT` 到 `4` 或 `2`，增加 `WB_POOL_SWITCH_DELAY` 到 `10`
+- **403 错误 (code=11140)**：这是 2026-10 起腾讯加强的内容审核
+  - 首选方案：启用 system 消息长度限制（默认已启用）
+  - 如果问题持续：设置 `WB_REMOVE_SYSTEM=1` 完全移除 system 消息
+  - 或者：设置 `WB_SYSTEM_TO_USER=1` 将长 system 转为 user 消息
+  - 同时建议：降低 `WB_MAX_SYSTEM_LENGTH` 到 `300` 或更低
 
 ## 网页控制台
 
@@ -245,16 +263,40 @@ WorkBuddy 的渠道校验不仅检查 HTTP 请求头，还会分析 system promp
 
 ## 国际版出站身份（渠道校验）
 
-上游会校验请求是否"像官方客户端发出的"，不通过时返回 `400 / code 11128`（`request illegal`，`displayTips` 提示"这次调用没通过渠道校验，可能不是官方客户端发出的"）。2026-10-19 起该校验对国际版明显收紧，只补 `system` 首条消息已不足以通过。
+上游会校验请求是否"像官方客户端发出的"，不通过时返回 `400 / code 11128`（`request illegal`，`displayTips` 提示"这次调用没通过渠道校验，可能不是官方客户端发出的"）或 `403 / code 11140`（可能需要更新客户端版本）。2026-10-19 起该校验对国际版明显收紧，只补 `system` 首条消息已不足以通过。
 
 代理按对 WorkBuddy 5.8.4 的抓包对齐了国际版出站身份，主要包括：
 
-- 版本与 UA：`X-IDE-Version: 5.8.4`，UA `WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`（可用 `WB_INTL_CLIENT_VERSION` / `WB_INTL_CLI_VERSION` 覆盖）。
+- 版本与 UA：`X-IDE-Version: 5.8.4`，UA `WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`。
 - 身份头：`X-Product: SaaS`、`X-Agent-Type: main`、`X-Agent-Intent: craft`、`X-Private-Data: true`。
 - 会话头族：`X-Conversation-ID`（带连字符 UUID，每请求现生成）、`X-Conversation-Request-ID` 与 `X-Root-Request-ID` 同值、`X-Conversation-Message-ID` 与 `X-Request-ID` 同值，后四者为 32 位 hex。
 - 链路头族：`X-Trace-ID`、`traceparent`、`b3`、`X-B3-TraceId`、`X-B3-SpanId`、`X-B3-Sampled`。
 - 对话请求不再发送 `X-Machine-ID` / `X-Session-ID`：官方只在反馈上报里发，恒定的派生值反而是网关特征。
 - 国际版不发送 `stream_options`（上游不认，国内版仍依赖它取 usage）。
+
+### 自动版本跟踪
+
+**从 v2.5.0 起，程序会自动跟踪最新的客户端版本**，无需手动更新配置。版本信息会缓存 24 小时，启动时自动加载。
+
+如果需要手动控制版本：
+
+```bash
+# 查看当前版本
+python wb2api.py --show-version
+
+# 手动更新版本缓存
+python wb2api.py --update-version
+
+# 使用环境变量覆盖（优先级最高）
+export WB_CLIENT_VERSION="5.9.0"
+export WB_CLI_VERSION="2.165.0"
+export WB_INTL_CLIENT_VERSION="5.9.0"
+export WB_INTL_CLI_VERSION="2.165.0"
+```
+
+版本缓存文件保存在数据目录的 `client_versions.json`。如果自动获取失败，会使用内置的默认版本（国内版和国际版均为 5.8.4 / CLI 2.161.0）。
+
+**更多关于客户端指纹模拟与反检测机制，请参阅 [FINGERPRINT.md](FINGERPRINT.md)**。
 
 **设备/会话标识按账号稳定派生**（技术路线参考同类项目
 [workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub) 的 `wb_fingerprint.derive_id`）：

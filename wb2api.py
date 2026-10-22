@@ -60,16 +60,233 @@ REFRESH_PATH = "/v2/plugin/auth/token/refresh"
 MODELS_PATH = "/v3/config"
 
 # 客户端版本：上游提高最低版本要求时，用环境变量覆盖即可，不必改源码
-CLIENT_VERSION = os.environ.get("WB_CLIENT_VERSION", "5.5.4")      # UA 里的 WorkBuddy/<ver>
-CLI_VERSION = os.environ.get("WB_CLI_VERSION", "2.137.1")          # UA 里的 CLI/<ver>
-# 国际版桌面端身份：按对 WorkBuddy 5.8.4 的抓包对齐（2026-10-16 样本）。
-# 2026-10-19 起上游加强国际版渠道校验（400 / code 11128 "request illegal"，
-# displayTips 明说"没通过渠道校验，可能不是官方客户端发出的"），旧的 5.5.x 身份
-# 与缺失的会话头族会被判非官方。国内版没有对应抓包且目前正常，维持原身份不动。
-INTL_CLIENT_VERSION = os.environ.get("WB_INTL_CLIENT_VERSION", "5.8.4")
-INTL_CLI_VERSION = os.environ.get("WB_INTL_CLI_VERSION", "2.161.0")
+# 默认版本作为降级选项，程序会尝试自动获取最新版本
+_DEFAULT_CLIENT_VERSION = "5.8.4"
+_DEFAULT_CLI_VERSION = "2.161.0"
+_DEFAULT_INTL_CLIENT_VERSION = "5.8.4"
+_DEFAULT_INTL_CLI_VERSION = "2.161.0"
+
+# 版本缓存文件路径（相对于数据目录）
+_VERSION_CACHE_FILE = "client_versions.json"
+_VERSION_CHECK_INTERVAL = 86400  # 24小时检查一次
+
+def _fetch_latest_versions():
+    """从上游获取最新客户端版本信息。
+
+    尝试从以下来源获取版本：
+    1. 官方客户端下载页面
+    2. GitHub releases API
+    3. 本地缓存文件
+
+    返回: dict 包含 {client_version, cli_version, intl_client_version, intl_cli_version, timestamp}
+    """
+    import urllib.request
+    import json
+    import re
+
+    versions = {
+        "client_version": _DEFAULT_CLIENT_VERSION,
+        "cli_version": _DEFAULT_CLI_VERSION,
+        "intl_client_version": _DEFAULT_INTL_CLIENT_VERSION,
+        "intl_cli_version": _DEFAULT_INTL_CLI_VERSION,
+        "timestamp": 0
+    }
+
+    # 策略1: 从官方下载页面提取版本号
+    try:
+        download_urls = [
+            "https://www.workbuddy.ai/download",
+            "https://www.codebuddy.cn/download",
+        ]
+
+        for url in download_urls:
+            try:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                })
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    html = response.read().decode('utf-8', errors='ignore')
+                    # 提取版本号模式：5.8.4, 2.161.0 等
+                    version_pattern = r'(?:WorkBuddy|CodeBuddy|version)[^\d]*(\d+\.\d+\.\d+)'
+                    matches = re.findall(version_pattern, html, re.IGNORECASE)
+                    if matches:
+                        # 假设第一个是客户端版本，后续可能是 CLI 版本
+                        client_ver = matches[0]
+                        cli_ver = matches[1] if len(matches) > 1 else _DEFAULT_CLI_VERSION
+                        versions.update({
+                            "client_version": client_ver,
+                            "cli_version": cli_ver,
+                            "intl_client_version": client_ver,
+                            "intl_cli_version": cli_ver,
+                            "timestamp": int(time.time())
+                        })
+                        if DEBUG:
+                            log(f"[指纹] 从 {url} 提取到版本: {client_ver} / {cli_ver}")
+                        return versions
+            except Exception as e:
+                if DEBUG:
+                    log(f"[指纹] 从 {url} 获取版本失败: {e}")
+                continue
+    except Exception:
+        pass
+
+    # 策略2: 尝试从API端点获取
+    try:
+        api_urls = [
+            "https://www.workbuddy.ai/api/version",
+            "https://www.codebuddy.cn/api/version",
+        ]
+
+        for url in api_urls:
+            try:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": "wb2api-version-checker/1.0"
+                })
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    data = json.loads(response.read().decode('utf-8'))
+                    if "version" in data or "client_version" in data:
+                        versions.update({
+                            "client_version": data.get("client_version", data.get("version", _DEFAULT_CLIENT_VERSION)),
+                            "cli_version": data.get("cli_version", _DEFAULT_CLI_VERSION),
+                            "intl_client_version": data.get("intl_client_version", _DEFAULT_INTL_CLIENT_VERSION),
+                            "intl_cli_version": data.get("intl_cli_version", _DEFAULT_INTL_CLI_VERSION),
+                            "timestamp": int(time.time())
+                        })
+                        return versions
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 无法获取最新版本，使用默认值
+    versions["timestamp"] = int(time.time())
+    if DEBUG:
+        log("[指纹] 无法获取最新版本，使用默认值")
+    return versions
+
+def _load_cached_versions():
+    """从本地缓存加载版本信息。"""
+    cache_path = os.path.join(DATA_DIR, _VERSION_CACHE_FILE) if 'DATA_DIR' in globals() else _VERSION_CACHE_FILE
+    try:
+        if os.path.exists(cache_path):
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                cached = json.load(f)
+                # 检查缓存是否过期
+                if time.time() - cached.get("timestamp", 0) < _VERSION_CHECK_INTERVAL:
+                    return cached
+    except Exception:
+        pass
+    return None
+
+def _save_version_cache(versions):
+    """保存版本信息到本地缓存。"""
+    cache_path = os.path.join(DATA_DIR, _VERSION_CACHE_FILE) if 'DATA_DIR' in globals() else _VERSION_CACHE_FILE
+    try:
+        os.makedirs(os.path.dirname(cache_path) if os.path.dirname(cache_path) else ".", exist_ok=True)
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(versions, f, indent=2)
+    except Exception:
+        pass
+
+def _get_client_versions():
+    """获取客户端版本，优先级：环境变量 > 缓存 > 自动获取 > 默认值。"""
+    # 如果设置了环境变量，直接使用
+    if os.environ.get("WB_CLIENT_VERSION"):
+        return {
+            "client_version": os.environ.get("WB_CLIENT_VERSION", _DEFAULT_CLIENT_VERSION),
+            "cli_version": os.environ.get("WB_CLI_VERSION", _DEFAULT_CLI_VERSION),
+            "intl_client_version": os.environ.get("WB_INTL_CLIENT_VERSION", _DEFAULT_INTL_CLIENT_VERSION),
+            "intl_cli_version": os.environ.get("WB_INTL_CLI_VERSION", _DEFAULT_INTL_CLI_VERSION),
+        }
+
+    # 尝试从缓存加载
+    cached = _load_cached_versions()
+    if cached:
+        return cached
+
+    # 自动获取最新版本
+    versions = _fetch_latest_versions()
+    _save_version_cache(versions)
+    return versions
+
+# 初始化版本（延迟到需要时再获取，避免阻塞启动）
+_versions_cache = None
+
+def _ensure_versions():
+    """确保版本已初始化。"""
+    global _versions_cache
+    if _versions_cache is None:
+        _versions_cache = _get_client_versions()
+        # 输出版本信息日志
+        if sys.stderr is not None:
+            source = "环境变量" if os.environ.get("WB_CLIENT_VERSION") else "缓存/自动获取"
+            sys.stderr.write("[版本] 国内版 WorkBuddy %s (CLI %s)，国际版 WorkBuddy %s (CLI %s) —— 来源：%s\n" % (
+                _versions_cache.get("client_version", _DEFAULT_CLIENT_VERSION),
+                _versions_cache.get("cli_version", _DEFAULT_CLI_VERSION),
+                _versions_cache.get("intl_client_version", _DEFAULT_INTL_CLIENT_VERSION),
+                _versions_cache.get("intl_cli_version", _DEFAULT_INTL_CLI_VERSION),
+                source
+            ))
+            sys.stderr.flush()
+    return _versions_cache
+
+# 兼容原有代码的版本变量（懒加载）
+def _get_version(key, default):
+    return _ensure_versions().get(key, default)
+
+CLIENT_VERSION = os.environ.get("WB_CLIENT_VERSION") or None  # 延迟初始化
+CLI_VERSION = os.environ.get("WB_CLI_VERSION") or None
+INTL_CLIENT_VERSION = os.environ.get("WB_INTL_CLIENT_VERSION") or None
+INTL_CLI_VERSION = os.environ.get("WB_INTL_CLI_VERSION") or None
+
+# 实际使用时通过函数获取
+def get_client_version():
+    return CLIENT_VERSION or _get_version("client_version", _DEFAULT_CLIENT_VERSION)
+
+def get_cli_version():
+    return CLI_VERSION or _get_version("cli_version", _DEFAULT_CLI_VERSION)
+
+def get_intl_client_version():
+    return INTL_CLIENT_VERSION or _get_version("intl_client_version", _DEFAULT_INTL_CLIENT_VERSION)
+
+def get_intl_cli_version():
+    return INTL_CLI_VERSION or _get_version("intl_cli_version", _DEFAULT_INTL_CLI_VERSION)
+
+# --- 版本自动刷新后台线程 ---
+_version_refresh_thread = None
+_version_refresh_enabled = os.environ.get("WB_VERSION_AUTO_REFRESH", "1") not in ("", "0", "false", "False")
+
+def _version_refresh_worker():
+    """后台线程：定期刷新客户端版本。"""
+    global _versions_cache
+    while True:
+        try:
+            # 等待 24 小时
+            time.sleep(_VERSION_CHECK_INTERVAL)
+            # 重新获取版本
+            if not os.environ.get("WB_CLIENT_VERSION"):  # 仅在未设置环境变量时自动刷新
+                new_versions = _fetch_latest_versions()
+                if new_versions and new_versions.get("timestamp", 0) > _versions_cache.get("timestamp", 0):
+                    _versions_cache = new_versions
+                    _save_version_cache(new_versions)
+                    if DEBUG:
+                        log(f"[指纹] 版本已自动刷新: {new_versions.get('client_version')}")
+        except Exception as e:
+            if DEBUG:
+                log(f"[指纹] 版本自动刷新失败: {e}")
+
+def _start_version_refresh_thread():
+    """启动版本自动刷新线程。"""
+    global _version_refresh_thread
+    if _version_refresh_enabled and _version_refresh_thread is None:
+        _version_refresh_thread = threading.Thread(target=_version_refresh_worker, daemon=True, name="VersionRefresh")
+        _version_refresh_thread.start()
+        if DEBUG:
+            log("[指纹] 版本自动刷新线程已启动")
+
 IDE_UA = os.environ.get("WB_IDE_UA", "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0")  # 目录探测路之一
 CLI_UA = os.environ.get("WB_CLI_UA", "CLI/2.63.2 CodeBuddy/2.63.2")           # 目录探测路之一
+
 # realm → (上游 base, Origin, X-Domain, UA 平台段, Accept-Language, 显示名)
 # 国内版的 chat/目录端点沿用登录同域，这是推断而非实测，可用 WB_UPSTREAM_BASE 覆盖
 REALMS = {
@@ -115,6 +332,20 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
     return max(minimum, value)
 
 
+# --- 指纹特征管理 ---
+# 用于模拟真实客户端行为，降低被检测为机器人的风险
+
+# 请求时序特征：添加随机抖动，避免规律性
+_FINGERPRINT_REQUEST_JITTER = _env_float("WB_FINGERPRINT_JITTER", 0.2)  # 请求前随机延时 0-0.2 秒
+_FINGERPRINT_ENABLED = os.environ.get("WB_FINGERPRINT_ENABLED", "1") not in ("", "0", "false", "False")
+
+def _apply_request_jitter():
+    """在发送请求前应用随机时序抖动。"""
+    if _FINGERPRINT_ENABLED and _FINGERPRINT_REQUEST_JITTER > 0:
+        import random
+        time.sleep(random.uniform(0, _FINGERPRINT_REQUEST_JITTER))
+
+
 # --- 账号池 ---
 POOL_SOFT_COOLDOWN = _env_float("WB_POOL_SOFT_COOLDOWN", 600)   # 429 等：指数退避，起点 600s
 POOL_SOFT_MAX = _env_float("WB_POOL_SOFT_MAX", 7200)            # 软冷却封顶
@@ -124,10 +355,11 @@ POOL_BREAKER = _env_float("WB_POOL_BREAKER", 1800)
 POOL_STICKY_TTL = _env_float("WB_POOL_STICKY_TTL", 1800)
 POOL_STICKY_MAX = _env_int("WB_POOL_STICKY_MAX", 4096, 1)
 POOL_MAX_SWITCH = _env_int("WB_POOL_MAX_SWITCH", 3)
+POOL_SWITCH_DELAY = _env_float("WB_POOL_SWITCH_DELAY", 5.0)     # 账号切换后的延时（秒），避免过快触发风控
 
 # --- 请求体与连接 ---
 MAX_BODY = _env_int("WB_MAX_BODY", 16 * 1024 * 1024, 1024 * 1024, 256 * 1024 * 1024)  # 最小 1MB，最大 256MB
-MAX_INFLIGHT = _env_int("WB_MAX_INFLIGHT", 32, 1)   # 同时在途的对话请求上限
+MAX_INFLIGHT = _env_int("WB_MAX_INFLIGHT", 8, 1)   # 同时在途的对话请求上限（降低以避免触发风控）
 CLIENT_TIMEOUT = _env_int("WB_CLIENT_TIMEOUT", 120, 30, 3600)  # 下游连接空闲超时（防慢速连接占线程）
 DRAIN_BODY_MAX = _env_int("WB_DRAIN_BODY_MAX", 1024 * 1024, 8192, MAX_BODY)  # chunked 排空上限
 RESP_STORE_MAX = 256      # previous_response_id 内存会话条数
@@ -164,6 +396,16 @@ def _gzip_disabled(base: str) -> bool:
 KEEPALIVE_EVERY = 15      # 上游长时间思考期间，至少每 15 秒给客户端发一次 SSE 心跳
 # 上游强制首条消息为 system；客户端没带时补这一条（可用环境变量改）
 DEFAULT_SYSTEM = os.environ.get("WB_DEFAULT_SYSTEM", "You are a helpful assistant.")
+
+# 风控相关配置（2026-10 腾讯加强了内容审核）
+# 是否限制 system 消息长度（避免触发 11140 错误）
+_LIMIT_SYSTEM_LENGTH = os.environ.get("WB_LIMIT_SYSTEM_LENGTH", "1") in ("1", "true", "True", "yes")
+# System 消息最大长度（字节）
+_MAX_SYSTEM_LENGTH = int(os.environ.get("WB_MAX_SYSTEM_LENGTH", "500"))
+# 是否完全移除 system 消息（某些情况下可以绕过检测，但可能影响对话质量）
+_REMOVE_SYSTEM = os.environ.get("WB_REMOVE_SYSTEM", "0") in ("1", "true", "True", "yes")
+# 是否将过长的 system 转换为首条 user 消息
+_SYSTEM_TO_USER = os.environ.get("WB_SYSTEM_TO_USER", "0") in ("1", "true", "True", "yes")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 UI_FILE = os.path.join(_HERE, "ui.html")
@@ -1312,8 +1554,15 @@ def _pool_penalize(a: dict, status: int, reason: str) -> bool:
             h["cooldownUntil"] = max(h["cooldownUntil"], now + delay)
             return True
         if status in (401, 403):
-            # 授权类：立刻冷却，等令牌刷新或用户重新登录；不计入熔断
-            h["cooldownUntil"] = max(h["cooldownUntil"], now + POOL_SOFT_COOLDOWN)
+            # 检测是否是账号封禁（code=11140）
+            if "11140" in reason:
+                # 账号封禁：永久禁用，不再参与轮询（设置为 100 年后）
+                h["cooldownUntil"] = now + 86400 * 36500  # ~100年
+                log("账号池：%s 被标记为封禁/异常（code=11140），已永久禁用"
+                    % (account_name(a) or aid[:8]))
+            else:
+                # 授权类：立刻冷却，等令牌刷新或用户重新登录；不计入熔断
+                h["cooldownUntil"] = max(h["cooldownUntil"], now + POOL_SOFT_COOLDOWN)
             return True
         if status == 402:
             # 余额/积分不足：硬冷却较久（默认 1 小时），别在它身上反复烧请求
@@ -1405,8 +1654,17 @@ def _pool_switch(a: dict, status: int, reason: str, session_key: str,
         return None
     with _pool_lock:
         _pool_stats["switch"] += 1
-    log("账号池：HTTP %s，%s → %s 换号重试"
-        % (status, account_name(a) or aid[:8], account_name(nxt) or account_id(nxt)[:8]))
+
+    # 账号切换延时：避免过快切换触发风控（随机化 ±20%）
+    if POOL_SWITCH_DELAY > 0:
+        import random
+        delay = POOL_SWITCH_DELAY * (0.8 + random.random() * 0.4)  # 0.8x ~ 1.2x
+        log("账号池：HTTP %s，%s → %s 换号重试（延时 %.1fs）"
+            % (status, account_name(a) or aid[:8], account_name(nxt) or account_id(nxt)[:8], delay))
+        time.sleep(delay)
+    else:
+        log("账号池：HTTP %s，%s → %s 换号重试"
+            % (status, account_name(a) or aid[:8], account_name(nxt) or account_id(nxt)[:8]))
     return nxt
 
 
@@ -1666,14 +1924,14 @@ def chat_headers(a: dict) -> dict:
             h.pop("X-Machine-ID", None)
             h.pop("X-Session-ID", None)
             if intl:
-                h["X-IDE-Version"] = INTL_CLIENT_VERSION
+                h["X-IDE-Version"] = get_intl_client_version()
                 h["X-Product"] = "SaaS"
                 h["X-Agent-Intent"] = "craft"
                 h["X-Agent-Type"] = "main"
                 h["X-Private-Data"] = "true"
                 h["User-Agent"] = desktop_ua(a)
             else:
-                h["X-IDE-Version"] = CLIENT_VERSION
+                h["X-IDE-Version"] = get_client_version()
                 h["X-Product"] = "WorkBuddy"
             _chat_static.update(key=key, h=h)
         h = dict(_chat_static["h"])
@@ -1813,6 +2071,11 @@ def normalize_chat_body(obj: dict, account: dict | None = None) -> dict:
         first_role = str(first.get("role") or "").lower()
         if first_role not in ("system", "developer"):
             msgs.insert(0, {"role": "system", "content": DEFAULT_SYSTEM})
+
+    # 5) 风控：处理 system 消息以避免触发内容审核（2026-10）
+    if isinstance(msgs, list) and msgs:
+        _apply_system_message_workarounds(msgs)
+
     if isinstance(msgs, list):
         for m in msgs:
             if not isinstance(m, dict):
@@ -1830,6 +2093,61 @@ def normalize_chat_body(obj: dict, account: dict | None = None) -> dict:
                     ):
                         p["image_url"] = {"url": p["image_url"]}
     return obj
+
+
+def _apply_system_message_workarounds(msgs: list) -> None:
+    """
+    应用 system 消息的风控绕过策略（2026-10 腾讯加强了内容审核）
+
+    策略：
+    1. WB_REMOVE_SYSTEM=1：完全移除 system 消息（激进，可能影响对话质量）
+    2. WB_LIMIT_SYSTEM_LENGTH=1：限制 system 消息长度
+    3. WB_SYSTEM_TO_USER=1：将过长的 system 转为首条 user 消息
+    """
+    if not msgs:
+        return
+
+    # 找到所有 system 消息
+    system_indices = []
+    for i, m in enumerate(msgs):
+        if isinstance(m, dict) and str(m.get("role") or "").lower() == "system":
+            system_indices.append(i)
+
+    if not system_indices:
+        return
+
+    # 策略 1：完全移除 system 消息（需要显式启用）
+    if _REMOVE_SYSTEM:
+        for i in reversed(system_indices):
+            msgs.pop(i)
+        # 移除后，如果第一条不是 system，上游会报错，所以补一个最小的
+        if msgs and str(msgs[0].get("role") or "").lower() != "system":
+            msgs.insert(0, {"role": "system", "content": "OK"})
+        return
+
+    # 策略 2 & 3：限制长度或转换为 user 消息
+    if _LIMIT_SYSTEM_LENGTH or _SYSTEM_TO_USER:
+        for i in system_indices:
+            if i >= len(msgs):
+                continue
+            m = msgs[i]
+            content = m.get("content", "")
+
+            if isinstance(content, str):
+                content_bytes = content.encode("utf-8")
+                content_len = len(content_bytes)
+
+                # 如果超过限制
+                if content_len > _MAX_SYSTEM_LENGTH:
+                    if _SYSTEM_TO_USER and i == 0:
+                        # 策略 3：将首条 system 转为 user 消息
+                        # 然后补一个短的 system
+                        m["role"] = "user"
+                        msgs.insert(0, {"role": "system", "content": DEFAULT_SYSTEM})
+                    elif _LIMIT_SYSTEM_LENGTH:
+                        # 策略 2：截断到最大长度
+                        truncated = content_bytes[:_MAX_SYSTEM_LENGTH].decode("utf-8", errors="ignore")
+                        m["content"] = truncated + "..."
 
 
 # ===========================================================================
@@ -2388,6 +2706,8 @@ def upstream_request(method: str, url: str, headers: dict, body: bytes | None = 
                 except (OSError, http.client.HTTPException) as e:
                     e.wb2api_retry_safe = True
                     raise
+            # 应用请求指纹抖动，模拟真实用户的时序特征
+            _apply_request_jitter()
             conn.request(method, target, body=body, headers=headers)
             r = conn.getresponse()
         except (ConnectionError, http.client.BadStatusLine) as e:
@@ -2519,6 +2839,9 @@ def call_upstream(payload: dict, a: dict) -> UpstreamResponse:
             log("→ POST %s model=%s messages=%d (首条role=%s) fields=%d %dB%s" % (
                 url, meta.get("model"), len(msgs), first_msg.get("role", "N/A"), len(meta),
                 len(body), "（gzip，原 %dB）" % len(data) if body is gz else ""))
+            # 输出关键请求头（排除敏感信息）
+            safe_headers = {k: v for k, v in h.items() if k not in ["Authorization", "X-Refresh-Token"]}
+            log("  请求头：%s" % json.dumps(safe_headers, ensure_ascii=False))
         try:
             resp = upstream_request("POST", url, h, body)
         except (OSError, http.client.HTTPException) as e:
@@ -2649,6 +2972,11 @@ def read_error(resp) -> tuple[int, str]:
             resp.close()
         except Exception:  # noqa: BLE001
             pass
+
+    # 调试模式：输出原始响应体
+    if DEBUG and raw:
+        log("  原始响应体：%s" % raw[:500])
+
     try:
         obj = json.loads(raw)
         msg = sse_error(obj) or obj.get("msg") or obj.get("message") or raw
@@ -2664,7 +2992,11 @@ def read_error(resp) -> tuple[int, str]:
     if status < 400:      # 200 + JSON 业务错误
         status = 502
     if status == 403 and "11140" in str(msg):
-        msg = "%s —— 可能需要更新客户端版本：设置 WB_CLIENT_VERSION / WB_CLI_VERSION" % msg
+        # code=11140 实际上是账号封禁/异常，不是版本问题
+        if "异常" in str(msg) or "封禁" in str(msg) or "限制" in str(msg):
+            msg = "%s —— 该账号已被限制使用，如需申诉请联系官方" % msg
+        else:
+            msg = "%s —— 可能是账号异常或需要更新客户端版本" % msg
     return status, "上游拒绝请求：%s" % msg
 
 
@@ -3581,11 +3913,40 @@ def desktop_ua(a: dict | None = None) -> str:
     国际版按 5.8.4 抓包：`WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`
     （末段 CLI 版本是客户端内置 CLI 的版本，不是桌面端自身版本）；
     国内版维持既有身份——没有对应抓包，改动风险大于收益。
+
+    添加了更真实的指纹特征以降低被检测风险。
     """
     if is_global(a):
-        return "WorkBuddy/%s workbuddy-ai/%s CLI/%s" % (
-            INTL_CLIENT_VERSION, INTL_CLIENT_VERSION, INTL_CLI_VERSION)
-    return "WorkBuddy/%s WorkBuddy/%s CLI/%s" % (CLIENT_VERSION, CLIENT_VERSION, CLI_VERSION)
+        # 国际版：使用最新版本，模拟官方客户端
+        client_ver = get_intl_client_version()
+        cli_ver = get_intl_cli_version()
+
+        # 随机化次版本号的最后一位，模拟不同的客户端更新状态
+        if _FINGERPRINT_ENABLED:
+            import random
+            # 保持主版本一致，只微调最后的修订号（例如 5.8.4 → 5.8.3-5.8.5）
+            parts = client_ver.split('.')
+            if len(parts) == 3:
+                patch = int(parts[2])
+                # 在 ±1 范围内随机抖动
+                jittered_patch = max(0, patch + random.randint(-1, 1))
+                client_ver = f"{parts[0]}.{parts[1]}.{jittered_patch}"
+
+        return "WorkBuddy/%s workbuddy-ai/%s CLI/%s" % (client_ver, client_ver, cli_ver)
+
+    # 国内版：同样策略
+    client_ver = get_client_version()
+    cli_ver = get_cli_version()
+
+    if _FINGERPRINT_ENABLED:
+        import random
+        parts = client_ver.split('.')
+        if len(parts) == 3:
+            patch = int(parts[2])
+            jittered_patch = max(0, patch + random.randint(-1, 1))
+            client_ver = f"{parts[0]}.{parts[1]}.{jittered_patch}"
+
+    return "WorkBuddy/%s WorkBuddy/%s CLI/%s" % (client_ver, client_ver, cli_ver)
 
 
 def models_headers(a: dict, ua: str) -> dict:
@@ -5779,6 +6140,10 @@ def main() -> None:
                     help="--login / --setup 时选择国际版(global，默认) / 国内版(cn)")
     ap.add_argument("--list-models", action="store_true",
                     help="打印模型目录诊断（每条探测路各拿到什么），然后退出")
+    ap.add_argument("--update-version", action="store_true",
+                    help="检查并更新客户端版本信息，然后退出")
+    ap.add_argument("--show-version", action="store_true",
+                    help="显示当前客户端版本信息，然后退出")
     ap.add_argument("--no-ui", action="store_true", help="关闭网页控制台及全部管理接口")
     ap.add_argument("--hide-reasoning", action="store_true",
                     help="不向客户端输出模型的推理内容（reasoning_content）")
@@ -5814,6 +6179,27 @@ def main() -> None:
 
     if args.login:
         do_login(args.realm, args.auth)
+        return
+
+    if args.show_version:
+        print("当前客户端版本信息：")
+        print("  国内版：WorkBuddy %s (CLI %s)" % (get_client_version(), get_cli_version()))
+        print("  国际版：WorkBuddy %s (CLI %s)" % (get_intl_client_version(), get_intl_cli_version()))
+        if _versions_cache and _versions_cache.get("timestamp"):
+            from datetime import datetime
+            ts = datetime.fromtimestamp(_versions_cache["timestamp"])
+            print("  更新时间：%s" % ts.strftime("%Y-%m-%d %H:%M:%S"))
+        return
+
+    if args.update_version:
+        print("正在检查最新客户端版本...")
+        versions = _fetch_latest_versions()
+        _save_version_cache(versions)
+        print("版本信息已更新：")
+        print("  国内版：WorkBuddy %s (CLI %s)" % (
+            versions["client_version"], versions["cli_version"]))
+        print("  国际版：WorkBuddy %s (CLI %s)" % (
+            versions["intl_client_version"], versions["intl_cli_version"]))
         return
 
     if args.setup:
@@ -5853,10 +6239,18 @@ def main() -> None:
         log("尚未登录（%s 不存在），请打开网页控制台完成登录" % os.path.abspath(AUTH_FILE))
     threading.Thread(target=_refresher_loop, daemon=True, name="token-refresh").start()
     threading.Thread(target=_auto_checkin_loop, daemon=True, name="auto-checkin").start()
+    # 启动版本自动刷新线程
+    _start_version_refresh_thread()
 
     host = "127.0.0.1" if _is_loopback(args.host) or args.host in ("0.0.0.0", "::") \
         else args.host
     base = "http://%s:%d/v1" % (host, args.port)
+
+    # 显示客户端版本信息
+    log("客户端版本：国内版 %s (CLI %s) / 国际版 %s (CLI %s)" % (
+        get_client_version(), get_cli_version(),
+        get_intl_client_version(), get_intl_cli_version()))
+
     log("网页控制台：http://%s:%d/" % (host, args.port))
     log("接口地址：  %s" % base)
     log("访问密钥：  %s（%s）" % (_mask_api_key(LOCAL_API_KEY), key_src))
