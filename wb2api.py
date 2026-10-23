@@ -159,7 +159,6 @@ def _fetch_latest_versions():
         pass
 
     # 无法获取最新版本，使用默认值
-    versions["timestamp"] = int(time.time())
     if DEBUG:
         log("[指纹] 无法获取最新版本，使用默认值")
     return versions
@@ -188,9 +187,23 @@ def _save_version_cache(versions):
     except Exception:
         pass
 
+def _default_versions(timestamp=0):
+    """返回内置版本；timestamp=0 表示这不是一次成功的在线查询。"""
+    return {
+        "client_version": _DEFAULT_CLIENT_VERSION,
+        "cli_version": _DEFAULT_CLI_VERSION,
+        "intl_client_version": _DEFAULT_INTL_CLIENT_VERSION,
+        "intl_cli_version": _DEFAULT_INTL_CLI_VERSION,
+        "timestamp": timestamp,
+    }
+
+
 def _get_client_versions():
-    """获取客户端版本，优先级：环境变量 > 缓存 > 自动获取 > 默认值。"""
-    # 如果设置了环境变量，直接使用
+    """读取可用版本；绝不因在线查询阻塞调用方。
+
+    优先级：环境变量 > 未过期缓存 > 内置默认值。在线查询由后台刷新线程负责，
+    这样离线启动和首个请求都不会等待多个版本源超时。
+    """
     if os.environ.get("WB_CLIENT_VERSION"):
         return {
             "client_version": os.environ.get("WB_CLIENT_VERSION", _DEFAULT_CLIENT_VERSION),
@@ -199,15 +212,10 @@ def _get_client_versions():
             "intl_cli_version": os.environ.get("WB_INTL_CLI_VERSION", _DEFAULT_INTL_CLI_VERSION),
         }
 
-    # 尝试从缓存加载
     cached = _load_cached_versions()
     if cached:
         return cached
-
-    # 自动获取最新版本
-    versions = _fetch_latest_versions()
-    _save_version_cache(versions)
-    return versions
+    return _default_versions()
 
 # 初始化版本（延迟到需要时再获取，避免阻塞启动）
 _versions_cache = None
@@ -217,9 +225,18 @@ def _ensure_versions():
     global _versions_cache
     if _versions_cache is None:
         _versions_cache = _get_client_versions()
+        if not _versions_cache.get("timestamp") and _version_refresh_enabled \
+                and not os.environ.get("WB_CLIENT_VERSION"):
+            # 缓存缺失或过期时先返回内置值，在线查询放到后台完成。
+            _start_version_refresh_thread(refresh_immediately=True)
         # 输出版本信息日志
         if sys.stderr is not None:
-            source = "环境变量" if os.environ.get("WB_CLIENT_VERSION") else "缓存/自动获取"
+            if os.environ.get("WB_CLIENT_VERSION"):
+                source = "环境变量"
+            elif _versions_cache.get("timestamp"):
+                source = "缓存"
+            else:
+                source = "内置默认值"
             sys.stderr.write("[版本] 国内版 WorkBuddy %s (CLI %s)，国际版 WorkBuddy %s (CLI %s) —— 来源：%s\n" % (
                 _versions_cache.get("client_version", _DEFAULT_CLIENT_VERSION),
                 _versions_cache.get("cli_version", _DEFAULT_CLI_VERSION),
@@ -254,6 +271,7 @@ def get_intl_cli_version():
 
 # --- 版本自动刷新后台线程 ---
 _version_refresh_thread = None
+_version_refresh_wakeup = threading.Event()
 _version_refresh_enabled = os.environ.get("WB_VERSION_AUTO_REFRESH", "1") not in ("", "0", "false", "False")
 
 def _version_refresh_worker():
@@ -261,21 +279,23 @@ def _version_refresh_worker():
     global _versions_cache
     while True:
         try:
-            # 等待 24 小时
-            time.sleep(_VERSION_CHECK_INTERVAL)
-            # 重新获取版本
+            # 启动后立即刷新一次；之后按缓存有效期等待，缓存缺失时沿用同一重试间隔。
+            _version_refresh_wakeup.wait(_VERSION_CHECK_INTERVAL)
+            _version_refresh_wakeup.clear()
             if not os.environ.get("WB_CLIENT_VERSION"):  # 仅在未设置环境变量时自动刷新
                 new_versions = _fetch_latest_versions()
-                if new_versions and new_versions.get("timestamp", 0) > _versions_cache.get("timestamp", 0):
+                if new_versions and new_versions.get("timestamp", 0) > (_versions_cache or {}).get("timestamp", 0):
                     _versions_cache = new_versions
                     _save_version_cache(new_versions)
                     if DEBUG:
                         log(f"[指纹] 版本已自动刷新: {new_versions.get('client_version')}")
+                elif DEBUG:
+                    log("[指纹] 版本在线查询失败，继续使用当前版本")
         except Exception as e:
             if DEBUG:
                 log(f"[指纹] 版本自动刷新失败: {e}")
 
-def _start_version_refresh_thread():
+def _start_version_refresh_thread(refresh_immediately=False):
     """启动版本自动刷新线程。"""
     global _version_refresh_thread
     if _version_refresh_enabled and _version_refresh_thread is None:
@@ -283,6 +303,8 @@ def _start_version_refresh_thread():
         _version_refresh_thread.start()
         if DEBUG:
             log("[指纹] 版本自动刷新线程已启动")
+    if refresh_immediately:
+        _version_refresh_wakeup.set()
 
 IDE_UA = os.environ.get("WB_IDE_UA", "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0")  # 目录探测路之一
 CLI_UA = os.environ.get("WB_CLI_UA", "CLI/2.63.2 CodeBuddy/2.63.2")           # 目录探测路之一
@@ -1450,6 +1472,22 @@ def _pool_members(realm: str) -> list[dict]:
     return members
 
 
+def _pool_member(aid: str, realm: str | None = None) -> dict | None:
+    """按账号 id 找池内成员；指定 realm 时绝不跨池。"""
+    if not aid:
+        return None
+    with _lock:
+        accounts = dict(_accounts)
+        if _auth:
+            accounts[account_id(_auth)] = _auth
+    a = accounts.get(aid)
+    if a is None or not a.get("accessToken"):
+        return None
+    if realm is not None and realm_of(a) != realm:
+        return None
+    return a
+
+
 def _health(aid: str) -> dict:
     with _pool_lock:
         h = _pool_health.get(aid)
@@ -2065,11 +2103,16 @@ def normalize_chat_body(obj: dict, account: dict | None = None) -> dict:
 
     # 4) 消息级归一：developer → system；image_url 字符串 → 对象
     msgs = obj.get("messages")
+    if isinstance(msgs, list):
+        for m in msgs:
+            if isinstance(m, dict) and isinstance(m.get("role"), str) \
+                    and m["role"].lower() == "developer":
+                m["role"] = "system"
     # 上游要求首条必须是 system（否则 400 code=11128）；客户端没给就补一条最小的
     if isinstance(msgs, list):
         first = msgs[0] if msgs and isinstance(msgs[0], dict) else {}
         first_role = str(first.get("role") or "").lower()
-        if first_role not in ("system", "developer"):
+        if first_role != "system":
             msgs.insert(0, {"role": "system", "content": DEFAULT_SYSTEM})
 
     # 5) 风控：处理 system 消息以避免触发内容审核（2026-10）
@@ -2080,9 +2123,6 @@ def normalize_chat_body(obj: dict, account: dict | None = None) -> dict:
         for m in msgs:
             if not isinstance(m, dict):
                 continue
-            role = m.get("role")
-            if isinstance(role, str) and role.lower() == "developer":
-                m["role"] = "system"
             parts = m.get("content")
             if isinstance(parts, list):
                 for p in parts:
@@ -2108,17 +2148,17 @@ def _apply_system_message_workarounds(msgs: list) -> None:
         return
 
     # 找到所有 system 消息
-    system_indices = []
+    system_messages = []
     for i, m in enumerate(msgs):
         if isinstance(m, dict) and str(m.get("role") or "").lower() == "system":
-            system_indices.append(i)
+            system_messages.append((i, m))
 
-    if not system_indices:
+    if not system_messages:
         return
 
     # 策略 1：完全移除 system 消息（需要显式启用）
     if _REMOVE_SYSTEM:
-        for i in reversed(system_indices):
+        for i in reversed([i for i, _ in system_messages]):
             msgs.pop(i)
         # 移除后，如果第一条不是 system，上游会报错，所以补一个最小的
         if msgs and str(msgs[0].get("role") or "").lower() != "system":
@@ -2127,10 +2167,8 @@ def _apply_system_message_workarounds(msgs: list) -> None:
 
     # 策略 2 & 3：限制长度或转换为 user 消息
     if _LIMIT_SYSTEM_LENGTH or _SYSTEM_TO_USER:
-        for i in system_indices:
-            if i >= len(msgs):
-                continue
-            m = msgs[i]
+        # 处理时不要复用原列表索引：插入新 system 会令后续索引整体后移。
+        for i, m in system_messages:
             content = m.get("content", "")
 
             if isinstance(content, str):
@@ -2414,9 +2452,11 @@ def anthropic_stream(resp, model: str, acc: ChatAccumulator, ping=None):
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
         raise
     except Exception as e:  # noqa: BLE001 - 已发送 HTTP 200，只能用 SSE 报错
-        acc.error = "上游响应流中断：%s" % e
+        # 上游异常文本可能回显提示词；客户端只拿通用提示，日志同样只留元数据。
+        safe_msg = _safe_stream_error(e)
+        acc.error = safe_msg
         acc.error_status = e.status if isinstance(e, UpstreamError) else 502
-        log("Anthropic 流中断：%s" % e)
+        log("Anthropic 流中断：%s" % safe_msg)
         yield _anthropic_event("error", {"error": {"type": "api_error", "message": acc.error}})
 
 
@@ -2785,7 +2825,8 @@ def _retry_delay(resp, attempt: int) -> float:
     return float(ra) if ra > 0 else RETRY_BASE_DELAY * (RETRY_FACTOR ** (attempt - 1))
 
 
-SENSITIVE_PAYLOAD_FIELDS = ("messages", "system", "prompt", "input", "instructions")
+SENSITIVE_PAYLOAD_FIELDS = ("messages", "system", "prompt", "input", "instructions",
+                            "msg", "message", "echo", "detail", "details", "error")
 
 
 def _safe_log_payload(payload: object) -> dict:
@@ -2797,6 +2838,170 @@ def _safe_log_payload(payload: object) -> dict:
     if not isinstance(payload, dict):
         return {}
     return {k: v for k, v in payload.items() if k not in SENSITIVE_PAYLOAD_FIELDS}
+
+
+# 调试请求头采用白名单：任何新加的凭证头默认都不会进日志。
+SAFE_LOG_HEADERS = frozenset((
+    "accept", "accept-language", "content-encoding", "content-type",
+    "origin", "referer", "user-agent", "x-agent-intent", "x-agent-purpose",
+    "x-agent-type", "x-codebuddy-request", "x-ide-name", "x-ide-type",
+    "x-ide-version", "x-private-data", "x-product", "x-requested-with",
+    "x-conversation-id", "x-request-id", "x-trace-id", "traceparent", "b3",
+    "x-b3-traceid", "x-b3-spanid", "x-b3-sampled",
+))
+
+
+def _safe_log_headers(headers: dict) -> dict:
+    """只返回明确允许记录的非敏感请求头（名与值都不含凭证）。"""
+    return {k: v for k, v in headers.items()
+            if isinstance(k, str) and k.lower() in SAFE_LOG_HEADERS}
+
+
+# SSE 调试日志只认这些协议字段；未列出的字段名即使形似标识符也不记录。
+SSE_LOG_FIELDS = frozenset((
+    "id", "object", "type", "event", "model", "created", "created_at",
+    "status", "choices", "usage", "delta", "message", "role", "finish_reason",
+    "index", "output", "output_index", "item", "item_id", "content",
+    "content_index", "sequence_number", "response", "error", "data",
+))
+
+# SSE 事件名同样来自上游；日志只显示这里列出的固定协议事件。
+SSE_LOG_EVENT_TYPES = frozenset((
+    "chat.completion.chunk",
+    "message_start", "message_delta", "message_stop",
+    "content_block_start", "content_block_delta", "content_block_stop",
+    "response.created", "response.in_progress", "response.completed",
+    "response.incomplete", "response.failed",
+    "response.output_item.added", "response.output_item.done",
+    "response.content_part.added", "response.content_part.done",
+    "response.output_text.delta", "response.output_text.done",
+    "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+    "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+    "response.function_call_arguments.delta", "response.function_call_arguments.done",
+    "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done",
+    "error",
+))
+
+
+def _sse_frame_metadata(data: str, raw_size: int) -> str:
+    """只从 SSE data 帧提取事件类型、字段名和字节数，绝不回显内容。"""
+    try:
+        obj = json.loads(data)
+    except (TypeError, ValueError):
+        return "data（无法解析，%d 字节）" % raw_size
+    if not isinstance(obj, dict):
+        return "data（非对象，%d 字节）" % raw_size
+    # 字段名同样可能被上游拼进自由文本；只输出已知协议字段名。
+    keys = sorted(str(k) for k in obj.keys() if isinstance(k, str)
+                  and k.lower() in SSE_LOG_FIELDS)
+    raw_type = obj.get("type") or obj.get("object") or obj.get("event")
+    if raw_type is None:
+        choices = obj.get("choices")
+        if isinstance(choices, list):
+            raw_type = "chat.completion.chunk"
+    # 上游可以把正文塞进 type/object/event；只保留已知协议事件名。
+    kind = raw_type if isinstance(raw_type, str) and raw_type in SSE_LOG_EVENT_TYPES \
+        else "unknown"
+    shown = ",".join(keys[:12]) + ("..." if len(keys) > 12 else "")
+    return "type=%s fields=[%s] %d 字节" % (kind, shown, raw_size)
+
+
+# 错误响应日志只提取这些元数据；其余字段即使嵌套在 data 里也不输出。
+ERROR_LOG_INT_FIELDS = frozenset((
+    "code", "error_code", "errcode", "status", "status_code", "httpstatus",
+))
+ERROR_LOG_ID_FIELDS = frozenset((
+    "request_id", "requestid", "trace_id", "traceid", "response_id",
+))
+_ERROR_LOG_SAFE_ID_RE = re.compile(
+    r"^(?:[0-9A-Fa-f]{8,128}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}|(?:req|trace|resp|response|span|evt)[-_][0-9A-Za-z._:-]{4,120})$",
+    re.IGNORECASE)
+_ERROR_LOG_INT_RE = re.compile(r"^-?\d{1,20}$")
+
+
+def _error_log_metadata(obj: object) -> dict:
+    """递归提取错误响应的安全元数据，绝不回显任意正文。
+
+    仅保留明确的标量字段；容器只作为递归路径，不把整个 data/error 对象
+    序列化进日志。字段名大小写不敏感，避免 Message/Code 等变体绕过。
+    """
+    def safe_value(key: str, value: object):
+        if key in ERROR_LOG_INT_FIELDS:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and _ERROR_LOG_INT_RE.fullmatch(value.strip()):
+                return int(value.strip())
+            return None
+        if key in ERROR_LOG_ID_FIELDS and isinstance(value, str):
+            value = value.strip()
+            return value if _ERROR_LOG_SAFE_ID_RE.fullmatch(value) else None
+        return None
+
+    found: dict = {}
+    top = obj if isinstance(obj, dict) else {}
+    top_code = safe_value("status_code", top.get("status_code"))
+    if top_code is None:
+        top_code = safe_value("error_code", top.get("error_code"))
+    if top_code is None:
+        top_code = safe_value("error_code", top.get("code"))
+    if top_code is None:
+        err = top.get("error")
+        if isinstance(err, dict):
+            top_code = safe_value("error_code", err.get("code"))
+    if top_code is not None:
+        found["code"] = top_code
+
+    def walk(node: object, depth: int = 0) -> None:
+        if depth > 4:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(key, str):
+                    normalized = key.lower()
+                    safe = safe_value(normalized, value)
+                    if safe is not None and normalized not in found:
+                        found[normalized] = safe
+                if isinstance(value, (dict, list)):
+                    walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node[:20]:
+                walk(item, depth + 1)
+
+    walk(obj)
+    return found
+
+
+def _safe_error_summary(status: int, obj: object = None, code: object = None) -> str:
+    """构造只含结构化元数据的错误摘要，供日志与用量文件使用。
+
+    上游错误正文可能回显用户提示词或凭证，因此这里绝不透传自由文本；
+    客户端仍会收到经过脱敏的可读错误信息，但持久化只保留状态码与错误码。
+    """
+    parts = ["HTTP %s" % (to_int(status) or 502)]
+    if code is None and isinstance(obj, dict):
+        meta = _error_log_metadata(obj)
+        code = meta.get("code", meta.get("error_code", meta.get("status_code")))
+    if isinstance(code, bool):
+        code = None
+    elif isinstance(code, str) and _ERROR_LOG_INT_RE.fullmatch(code.strip()):
+        code = int(code.strip())
+    elif not isinstance(code, int):
+        code = None
+    if code is not None:
+        parts.append("code=%s" % code)
+    meta = _error_log_metadata(obj) if isinstance(obj, dict) else {}
+    rid = meta.get("request_id") or meta.get("trace_id") or meta.get("response_id")
+    if rid:
+        parts.append("request_id=%s" % rid)
+    return "上游错误（%s）" % "，".join(parts)
+
+
+def _safe_stream_error(exc: BaseException) -> str:
+    """流式阶段异常的通用安全提示；绝不返回上游自由文本。"""
+    status = getattr(exc, "status", 502) or 502
+    return "上游响应流中断（HTTP %s）" % to_int(status)
 
 
 _chat_path = CHAT_PATH
@@ -2839,8 +3044,8 @@ def call_upstream(payload: dict, a: dict) -> UpstreamResponse:
             log("→ POST %s model=%s messages=%d (首条role=%s) fields=%d %dB%s" % (
                 url, meta.get("model"), len(msgs), first_msg.get("role", "N/A"), len(meta),
                 len(body), "（gzip，原 %dB）" % len(data) if body is gz else ""))
-            # 输出关键请求头（排除敏感信息）
-            safe_headers = {k: v for k, v in h.items() if k not in ["Authorization", "X-Refresh-Token"]}
+            # 只输出安全白名单内的请求头，凭证与设备标识默认不落日志。
+            safe_headers = _safe_log_headers(h)
             log("  请求头：%s" % json.dumps(safe_headers, ensure_ascii=False))
         try:
             resp = upstream_request("POST", url, h, body)
@@ -2957,10 +3162,11 @@ def sse_error(obj) -> str | None:
     return None
 
 
-def read_error(resp) -> tuple[int, str]:
-    """读取上游错误响应，返回 (状态码, 清洗后的错误摘要)。
+def read_error(resp) -> tuple[int, str, int | None]:
+    """读取上游错误响应，返回 (状态码, 清洗后的错误摘要, 安全错误码)。
 
     错误摘要用于返回客户端和记录日志，已脱敏敏感信息并限制长度。
+    第三个返回值只含数字错误码，供账号池判断 code=11140 等结构性条件。
     """
     status = getattr(resp, "status", 502) or 502
     try:
@@ -2973,14 +3179,35 @@ def read_error(resp) -> tuple[int, str]:
         except Exception:  # noqa: BLE001
             pass
 
-    # 调试模式：输出原始响应体
+    # 调试模式只记录脱敏后的摘要；上游错误可能回显用户提示词或凭证。
     if DEBUG and raw:
-        log("  原始响应体：%s" % raw[:500])
+        try:
+            err_obj = json.loads(raw)
+            metadata = _error_log_metadata(err_obj)
+            summary = json.dumps(metadata, ensure_ascii=False, separators=(",", ":")) \
+                if metadata else ""
+        except Exception:  # noqa: BLE001 - 非 JSON 错误体也绝不记录原文
+            summary = ""
+        if summary:
+            log("  上游错误响应元数据（HTTP %s）：%s"
+                % (status, _sanitize_for_log(summary, max_len=500)))
+        else:
+            log("  上游错误响应：无可记录元数据（HTTP %s，%d 字节）" % (status, len(raw)))
 
+    err_obj = None
+    err_code = None
     try:
         obj = json.loads(raw)
+        err_obj = obj
         msg = sse_error(obj) or obj.get("msg") or obj.get("message") or raw
-        code = obj.get("code")
+        # 与调试日志共用同一个结构化元数据解析器，避免两套提取逻辑再次分叉。
+        meta = _error_log_metadata(obj)
+        err_code = meta.get("code")
+        if err_code is None:
+            err_code = meta.get("error_code")
+        if err_code is None:
+            err_code = meta.get("status_code")
+        code = err_code
         if code is not None and "code=" not in str(msg):
             msg = "%s (code=%s)" % (msg, code)
     except Exception:  # noqa: BLE001
@@ -2997,7 +3224,9 @@ def read_error(resp) -> tuple[int, str]:
             msg = "%s —— 该账号已被限制使用，如需申诉请联系官方" % msg
         else:
             msg = "%s —— 可能是账号异常或需要更新客户端版本" % msg
-    return status, "上游拒绝请求：%s" % msg
+    # 返回值同时用于客户端提示和持久化：客户端需要可读原因，日志/用量只允许
+    # 结构化摘要。调用方通过 _safe_error_summary 生成后者。
+    return status, "上游拒绝请求：%s" % msg, err_code
 
 
 # ===========================================================================
@@ -3026,12 +3255,13 @@ def iter_chunks(resp, ping=None):
             continue                              # event: / id: / retry: 都用不上
         saw_data = True
         line = raw.decode("utf-8", "replace").rstrip("\r\n")
-        if dumped < 6:
-            dumped += 1
-            log("  流事件：%s" % line[:300])
         data = line[6:] if line.startswith("data: ") else line[5:]
+        frame_size = len(raw)
         if not buf:
             if data == "[DONE]" or data.strip() == "[DONE]":
+                if dumped < 6:
+                    dumped += 1
+                    log("  流事件：[DONE]")
                 if hasattr(resp, "saw_done"):
                     resp.saw_done = True
                     # 先把上游连接还回池，再给客户端写收尾帧：客户端紧接着发下一个请求时就能复用
@@ -3044,6 +3274,7 @@ def iter_chunks(resp, ping=None):
                 continue
         else:
             buf.append(data)
+            frame_size += 1                     # 被吞掉的换行
             try:
                 obj = loads("\n".join(buf))
             except ValueError:
@@ -3052,6 +3283,11 @@ def iter_chunks(resp, ping=None):
                 continue
             buf.clear()
         if isinstance(obj, dict):
+            if dumped < 6:
+                dumped += 1
+                # data 帧可能包含模型输出、工具参数或用户内容；只记录结构元数据。
+                log("  流事件：%s" % _sse_frame_metadata(json.dumps(obj, ensure_ascii=False),
+                                                        frame_size))
             yield obj
     if not saw_data:
         # HTTP 200 但正文里没有任何 data: 行：通常是 JSON 业务错误或非 SSE 响应，不能当成空成功
@@ -3451,6 +3687,13 @@ class _RespStore:
                 self._drop(next(iter(self._d)))
         return True
 
+    def owner(self, rid: str) -> str | None:
+        """返回仍有效历史的所属账号；不返回历史内容。"""
+        with self._mu:
+            self._prune(time.monotonic())
+            v = self._d.get(rid)
+            return v[2] if v else None
+
     def get(self, rid: str, owner: str = ""):
         with self._mu:
             self._prune(time.monotonic())
@@ -3807,9 +4050,8 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
         for chunk in iter_chunks(resp, ping):
             err = sse_error(chunk)
             if err:
-                # 脱敏错误信息
-                sanitized_err = _sanitize_for_log(str(err), max_len=300)
-                raise UpstreamError(502, sanitized_err)
+                # SSE 错误正文可能回显提示词；只保留状态码元数据。
+                raise UpstreamError(502, _safe_error_summary(502, chunk))
             for e in acc.feed(chunk):
                 if e[1] != 0:
                     continue
@@ -3835,10 +4077,10 @@ def responses_stream(resp, model, rid: str, ctx: dict, acc: ChatAccumulator, pin
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
         raise
     except Exception as e:  # noqa: BLE001 - 上游中途断流：给客户端一个明确的失败事件
-        # 脱敏异常信息用于日志
-        sanitized_msg = _sanitize_for_log(str(e), max_len=200)
+        # 上游异常文本可能回显提示词；只留状态码元数据。
+        sanitized_msg = _safe_stream_error(e)
         log("Responses 流中断：%s" % sanitized_msg)
-        acc.error = "上游响应流中断：%s" % sanitized_msg
+        acc.error = sanitized_msg
         acc.error_status = e.status if isinstance(e, UpstreamError) else 502
         failed = snapshot("failed", output)
         failed["error"] = {"code": "server_error", "message": acc.error}
@@ -5633,9 +5875,27 @@ class Handler(BaseHTTPRequestHandler):
         # 账号池：先按当前账号所在的池挑一个可用成员；池内换号只影响本次请求，
         # 不改变控制台上的当前账号。
         session_key = _pool_session_key(self)
+        is_resp = path == "/v1/responses"
+        prev_owner = None
+        if is_resp and isinstance(body.get("previous_response_id"), str) \
+                and body["previous_response_id"]:
+            prev_owner = RESP_STORE.owner(body["previous_response_id"])
         try:
-            a = _pool_pick(realm_of(_auth), session_key) or ensure_auth()
+            if prev_owner:
+                # 续接必须回到创建该响应的账号；换个账号会改变上游身份，
+                # 即使请求成功也无法合法取得这段历史。账号 id 本身已按
+                # realm 隔离，这里按历史账号自己的 realm 查找，跨区域切换后
+                # 依然能续接。
+                a = _pool_member(prev_owner)
+                if a is None or not _pool_available(prev_owner):
+                    return self._error(400, "previous_response_id 所属账号当前不可用",
+                                       "invalid_request_error")
+            else:
+                a = _pool_pick(realm_of(_auth), session_key) or ensure_auth()
         except Exception:  # noqa: BLE001 - 池异常时退回原行为
+            if prev_owner:
+                return self._error(400, "previous_response_id 所属账号当前不可用",
+                                   "invalid_request_error")
             a = ensure_auth()
 
         model, err = resolve_model(body.get("model"), a)
@@ -5644,7 +5904,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(code, err)
         body["model"] = model
         want_stream = body.get("stream") is True
-        is_resp = path == "/v1/responses"
         is_anthropic = path == "/v1/messages"
         ctx = None
         if is_resp:
@@ -5664,6 +5923,7 @@ class Handler(BaseHTTPRequestHandler):
         acc = ChatAccumulator()
         status, ttft = 200, None
         tried: set[str] = set()
+        allow_pool_switch = not bool(prev_owner)
         logical_request_id = _uuid7().hex
         resp = None
         try:
@@ -5676,7 +5936,7 @@ class Handler(BaseHTTPRequestHandler):
                     resp = call_upstream(payload, a)
                 except UpstreamError as e:
                     status = e.status
-                    if _pool_can_switch(a, e.status, tried):
+                    if allow_pool_switch and _pool_can_switch(a, e.status, tried):
                         nxt = _pool_switch(a, e.status, e.msg, session_key, tried)
                         if nxt is not None:
                             a = nxt
@@ -5684,7 +5944,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(e.status, e.msg, retry_after=e.retry_after)
                 except Exception as e:  # noqa: BLE001
                     status = 502
-                    if getattr(e, "wb2api_retry_safe", False) and _pool_can_switch(a, 502, tried):
+                    if allow_pool_switch and getattr(e, "wb2api_retry_safe", False) \
+                            and _pool_can_switch(a, 502, tried):
                         nxt = _pool_switch(a, 502, str(e), session_key, tried)
                         if nxt is not None:
                             a = nxt
@@ -5694,10 +5955,12 @@ class Handler(BaseHTTPRequestHandler):
 
                 if resp.status >= 400 or not is_sse(resp):
                     ra = resp.headers.get("Retry-After") or ""
-                    status, msg = read_error(resp)
-                    log("上游 %s：%s" % (status, msg))
-                    if _pool_can_switch(a, status, tried):
-                        nxt = _pool_switch(a, status, msg, session_key, tried)
+                    status, msg, err_code = read_error(resp)
+                    # 日志与池惩罚只记录结构化摘要（含错误码），绝不写入正文。
+                    safe_reason = _safe_error_summary(status, code=err_code)
+                    log(safe_reason)
+                    if allow_pool_switch and _pool_can_switch(a, status, tried):
+                        nxt = _pool_switch(a, status, safe_reason, session_key, tried)
                         if nxt is not None:
                             a = nxt
                             continue
@@ -5738,7 +6001,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, out)
         finally:
             secs = time.time() - t0
-            record_usage(path, model, status, acc.usage, secs, ttft, want_stream, self._last_error, account=a)
+            # usage.jsonl 只落安全摘要；上游回显文本绝不出现在持久化记录里。
+            safe_error = _safe_error_summary(status) if self._last_error else ""
+            record_usage(path, model, status, acc.usage, secs, ttft, want_stream,
+                         safe_error, account=a)
             u = acc.usage or {}
             log("接口=%s 模型=%s 状态=%s 耗时=%.1f秒%s%s" % (
                 path.rsplit("/", 1)[-1], model, status, secs,
@@ -5764,9 +6030,8 @@ class Handler(BaseHTTPRequestHandler):
                     for obj in iter_chunks(resp, ping):
                         err = sse_error(obj)
                         if err:
-                            # 脱敏错误信息用于日志和客户端
-                            sanitized_err = _sanitize_for_log(str(err), max_len=300)
-                            raise UpstreamError(502, "上游返回错误：%s" % sanitized_err)
+                            # SSE 错误正文可能回显提示词；只保留状态码元数据。
+                            raise UpstreamError(502, _safe_error_summary(502, obj))
                         u = obj.get("usage")
                         if u.__class__ is dict:           # chat 流只需 usage（用量记录），不必累加全文
                             acc.usage = u
@@ -5778,13 +6043,13 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     raise
                 except Exception as e:  # noqa: BLE001 - 上游中途断流
-                    # 脱敏异常信息用于日志
-                    sanitized_msg = _sanitize_for_log(str(e), max_len=200)
+                    # 上游异常文本可能回显提示词；日志与用量文件都只留元数据。
+                    sanitized_msg = _safe_stream_error(e)
                     log("chat 流中断：%s" % sanitized_msg)
-                    acc.error = "上游响应流中断：%s" % sanitized_msg
+                    acc.error = sanitized_msg
                     acc.error_status = e.status if isinstance(e, UpstreamError) else 502
                     self._chunk("data: %s\n\n" % json.dumps(
-                        {"error": {"message": "上游响应流中断：%s" % sanitized_msg,
+                        {"error": {"message": sanitized_msg,
                                    "type": "upstream_error"}}, ensure_ascii=False))
                 self._chunk("data: [DONE]\n\n")
             elif path == "/v1/messages":
@@ -6182,20 +6447,29 @@ def main() -> None:
         return
 
     if args.show_version:
+        versions = _ensure_versions()
         print("当前客户端版本信息：")
-        print("  国内版：WorkBuddy %s (CLI %s)" % (get_client_version(), get_cli_version()))
-        print("  国际版：WorkBuddy %s (CLI %s)" % (get_intl_client_version(), get_intl_cli_version()))
-        if _versions_cache and _versions_cache.get("timestamp"):
+        print("  国内版：WorkBuddy %s (CLI %s)" % (
+            versions.get("client_version", _DEFAULT_CLIENT_VERSION),
+            versions.get("cli_version", _DEFAULT_CLI_VERSION)))
+        print("  国际版：WorkBuddy %s (CLI %s)" % (
+            versions.get("intl_client_version", _DEFAULT_INTL_CLIENT_VERSION),
+            versions.get("intl_cli_version", _DEFAULT_INTL_CLI_VERSION)))
+        if versions.get("timestamp"):
             from datetime import datetime
-            ts = datetime.fromtimestamp(_versions_cache["timestamp"])
+            ts = datetime.fromtimestamp(versions["timestamp"])
             print("  更新时间：%s" % ts.strftime("%Y-%m-%d %H:%M:%S"))
+        else:
+            print("  来源：内置默认值（缓存缺失或已过期）")
         return
 
     if args.update_version:
         print("正在检查最新客户端版本...")
         versions = _fetch_latest_versions()
-        _save_version_cache(versions)
-        print("版本信息已更新：")
+        fetched = bool(versions.get("timestamp"))
+        if fetched:
+            _save_version_cache(versions)
+        print("版本信息已更新：" if fetched else "未能获取最新版本，继续使用内置默认值（未写入缓存）：")
         print("  国内版：WorkBuddy %s (CLI %s)" % (
             versions["client_version"], versions["cli_version"]))
         print("  国际版：WorkBuddy %s (CLI %s)" % (

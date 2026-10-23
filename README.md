@@ -41,7 +41,7 @@ export OPENAI_API_KEY=<控制台显示的访问密钥>
 - 鉴权：`Authorization: Bearer <密钥>` 或 `x-api-key: <密钥>`。
 - 路径容错：少写 `/v1`（如 `/chat/completions`）、结尾斜杠、经 HTTP 代理发出的绝对 URL 请求行都能正确路由。
 - Anthropic SDK：`ANTHROPIC_BASE_URL=http://127.0.0.1:8787`，`ANTHROPIC_API_KEY=<密钥>`。不支持 Anthropic 服务端工具、PDF 内容块和 `/v1/messages/count_tokens`。
-- Responses 的 `previous_response_id` 历史只存在内存中：最多 256 条、保留 6 小时、总量 32 MiB，重启后无法续接。
+- Responses 的 `previous_response_id` 历史只存在内存中：最多 256 条、保留 6 小时、总量 32 MiB，重启后无法续接。续接请求会固定回到创建该响应的账号，不参与池内换号；原账号冷却或已移除时会返回 400，而不会把历史发往其他账号。
 
 ## 访问密钥
 
@@ -102,9 +102,9 @@ export OPENAI_API_KEY=<控制台显示的访问密钥>
 
 ### 客户端版本
 
-版本取值优先级：环境变量 > 数据目录的 `client_versions.json` 缓存（24 小时有效）> 在线获取 > 内置默认值（`5.8.4` / CLI `2.161.0`）。
+版本取值优先级：环境变量 > 数据目录的 `client_versions.json` 缓存（24 小时有效）> 内置默认值（`5.8.4` / CLI `2.161.0`）。在线获取不会阻塞启动或请求，服务会先用现有缓存或内置值启动，再由后台线程刷新。
 
-在线获取会尝试解析 `www.workbuddy.ai/download`、`www.codebuddy.cn/download` 页面中的版本号以及 `/api/version` 接口；这些来源并非官方公开的版本接口，解析失败时回退默认值。服务运行期间有后台线程每 24 小时重新获取一次（`WB_VERSION_AUTO_REFRESH=0` 关闭）。
+在线获取会尝试解析 `www.workbuddy.ai/download`、`www.codebuddy.cn/download` 页面中的版本号以及 `/api/version` 接口；这些来源并非官方公开的版本接口，解析失败时回退默认值。失败结果不会被写成新鲜缓存，避免一次短暂断网让默认值沿用 24 小时。服务运行期间有后台线程启动后刷新一次，之后每 24 小时重试（`WB_VERSION_AUTO_REFRESH=0` 关闭）。
 
 ```bash
 python wb2api.py --show-version     # 查看当前版本
@@ -134,7 +134,8 @@ python wb2api.py --update-version   # 立即重新获取并写入缓存
 ## 错误提示
 
 - `403` 且含 `code=11140`：响应里带“异常 / 封禁 / 限制”字样时提示账号已被限制使用；账号池会把该账号移出轮询。
-- `--debug` 下会打印发往上游的请求头（不含 `Authorization`）和上游错误响应的原始内容（前 500 字符），不打印对话正文。
+- `--debug` 下会打印发往上游的请求头（不含 `Authorization`）和上游错误响应的脱敏元数据，不打印对话正文、错误正文回显或凭证。
+- 错误响应可能回显提示词或凭证，因此日志与 `usage.jsonl` 只记录 HTTP 状态码、上游错误码等结构化元数据；客户端仍会收到经过脱敏的可读错误信息。
 
 ## 签到与积分
 
@@ -166,7 +167,7 @@ python wb2api.py --update-version   # 立即重新获取并写入缓存
 | `--show-version` / `--update-version` | 查看 / 重新获取客户端版本后退出 |
 | `--no-ui` | 关闭网页控制台和管理接口 |
 | `--hide-reasoning` | 不向客户端输出 `reasoning_content` |
-| `--debug` | 打印上游请求元数据与前几帧 SSE（`WB_DEBUG=1`） |
+| `--debug` | 打印上游请求元数据与前几帧 SSE 的结构摘要（`WB_DEBUG=1`） |
 
 ## 环境变量
 
@@ -194,6 +195,6 @@ python wb2api.py --update-version   # 立即重新获取并写入缓存
 
 ## 本地状态文件
 
-运行时会在数据目录生成：`accounts.json`、`auth.json`、`api_key.txt`、`selection.json`、`settings.json`、`models_cache.json`、`usage.jsonl`、`client_versions.json`。前三个含账号令牌和访问密钥，**不要提交或分享**。仓库当前没有 `.gitignore`，提交前请确认这些文件未被加入。
+运行时会在数据目录生成：`accounts.json`、`auth.json`、`api_key.txt`、`selection.json`、`settings.json`、`models_cache.json`、`usage.jsonl`、`client_versions.json`。前三个含账号令牌和访问密钥，**不要提交或分享**。仓库的 `.gitignore` 已覆盖这些文件；若使用 `WB_DATA_DIR` 或自定义文件名，请确认其路径仍在忽略规则内，或另加忽略规则。
 
 停止程序后删除这些文件即可恢复到未登录状态。
