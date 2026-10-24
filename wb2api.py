@@ -30,6 +30,7 @@ import collections
 import hashlib
 import hmac
 import http.client
+from html.parser import HTMLParser
 import json
 import math
 import os
@@ -61,14 +62,67 @@ MODELS_PATH = "/v3/config"
 
 # 客户端版本：上游提高最低版本要求时，用环境变量覆盖即可，不必改源码
 # 默认版本作为降级选项，程序会尝试自动获取最新版本
-_DEFAULT_CLIENT_VERSION = "5.8.4"
-_DEFAULT_CLI_VERSION = "2.161.0"
+# 国内版从国内稳定归档获取，国际版从国际站官方更新接口获取。
+# 以下回退值于 2026-10-23 核验；构建号只用于下载，指纹使用前三段产品版本。
+_DEFAULT_CLIENT_VERSION = "5.8.3"
+_DEFAULT_CLI_VERSION = "2.162.0"
 _DEFAULT_INTL_CLIENT_VERSION = "5.8.4"
-_DEFAULT_INTL_CLI_VERSION = "2.161.0"
+_DEFAULT_INTL_CLI_VERSION = "2.162.0"
 
 # 版本缓存文件路径（相对于数据目录）
 _VERSION_CACHE_FILE = "client_versions.json"
 _VERSION_CHECK_INTERVAL = 86400  # 24小时检查一次
+
+
+class _VisibleTextParser(HTMLParser):
+    """提取发布文档可见文本，避免把脚本和样式里的版本号当作最新版本。"""
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._skip:
+            self._skip -= 1
+
+    def handle_data(self, data):
+        if not self._skip:
+            self.parts.append(data)
+
+
+def _latest_document_version(html):
+    parser = _VisibleTextParser()
+    parser.feed(html)
+    match = re.search(r"\bv?(\d+\.\d+\.\d+)\b", " ".join(parser.parts))
+    return match.group(1) if match else None
+
+
+def _latest_cli_version(html):
+    """提取 CLI 发布页中的正式版本，避免被导航或正文里的旧版本号干扰。"""
+    match = re.search(r"CodeBuddy Code v(\d+\.\d+\.\d+)", html, re.IGNORECASE)
+    return match.group(1) if match else _latest_document_version(html)
+
+
+def _version_refresh_due(versions, today=None):
+    """仅在某地区本地日期尚未成功探测时安排当天的后台刷新。"""
+    today = today or time.strftime("%Y-%m-%d")
+    regions = (
+        ("cn", "WB_CLIENT_VERSION"),
+        ("intl", "WB_INTL_CLIENT_VERSION"),
+    )
+    for realm, client_env in regions:
+        if os.environ.get(client_env):
+            continue
+        if versions.get(realm + "_checked_date") != today:
+            return True
+    if not (os.environ.get("WB_CLI_VERSION") and os.environ.get("WB_INTL_CLI_VERSION")) \
+            and versions.get("cli_checked_date") != today:
+        return True
+    return False
 
 def _fetch_latest_versions():
     """从上游获取最新客户端版本信息。
@@ -89,78 +143,66 @@ def _fetch_latest_versions():
         "cli_version": _DEFAULT_CLI_VERSION,
         "intl_client_version": _DEFAULT_INTL_CLIENT_VERSION,
         "intl_cli_version": _DEFAULT_INTL_CLI_VERSION,
-        "timestamp": 0
+        "timestamp": 0,
+        "cn_timestamp": 0,
+        "intl_timestamp": 0,
     }
 
-    # 策略1: 从官方下载页面提取版本号
+    stable_history_url = "https://www.codebuddy.cn/docs/workbuddy/Download-History"
+    intl_update_url = "https://www.workbuddy.ai/v2/update?platform=workbuddy-win32-x64-user"
+    cli_url = "https://www.workbuddy.ai/docs/cli/release-notes/README"
+    now = int(time.time())
     try:
-        download_urls = [
-            "https://www.workbuddy.ai/download",
-            "https://www.codebuddy.cn/download",
-        ]
+        req = urllib.request.Request(stable_history_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        with urllib.request.urlopen(req, timeout=5) as response:
+            page = response.read().decode("utf-8", errors="ignore")
+        client_ver = _latest_document_version(page)
+        if client_ver:
+            versions["client_version"] = client_ver
+            versions["cn_timestamp"] = now
+            versions["cn_checked_date"] = time.strftime("%Y-%m-%d", time.localtime(now))
+    except Exception as e:
+        if DEBUG:
+            log("[指纹] 国内版下载页版本获取失败：%s" % e)
 
-        for url in download_urls:
-            try:
-                req = urllib.request.Request(url, headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                })
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    html = response.read().decode('utf-8', errors='ignore')
-                    # 提取版本号模式：5.8.4, 2.161.0 等
-                    version_pattern = r'(?:WorkBuddy|CodeBuddy|version)[^\d]*(\d+\.\d+\.\d+)'
-                    matches = re.findall(version_pattern, html, re.IGNORECASE)
-                    if matches:
-                        # 假设第一个是客户端版本，后续可能是 CLI 版本
-                        client_ver = matches[0]
-                        cli_ver = matches[1] if len(matches) > 1 else _DEFAULT_CLI_VERSION
-                        versions.update({
-                            "client_version": client_ver,
-                            "cli_version": cli_ver,
-                            "intl_client_version": client_ver,
-                            "intl_cli_version": cli_ver,
-                            "timestamp": int(time.time())
-                        })
-                        if DEBUG:
-                            log(f"[指纹] 从 {url} 提取到版本: {client_ver} / {cli_ver}")
-                        return versions
-            except Exception as e:
-                if DEBUG:
-                    log(f"[指纹] 从 {url} 获取版本失败: {e}")
-                continue
-    except Exception:
-        pass
-
-    # 策略2: 尝试从API端点获取
     try:
-        api_urls = [
-            "https://www.workbuddy.ai/api/version",
-            "https://www.codebuddy.cn/api/version",
-        ]
+        req = urllib.request.Request(intl_update_url, headers={
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        with urllib.request.urlopen(req, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+        raw_version = str(payload.get("productVersion") or payload.get("version") or "")
+        match = re.search(r"\d+\.\d+\.\d+", raw_version)
+        if match:
+            versions["intl_client_version"] = match.group(0)
+            versions["intl_timestamp"] = now
+            versions["intl_checked_date"] = time.strftime("%Y-%m-%d", time.localtime(now))
+    except Exception as e:
+        if DEBUG:
+            log("[指纹] 国际版更新接口版本获取失败：%s" % e)
 
-        for url in api_urls:
-            try:
-                req = urllib.request.Request(url, headers={
-                    "User-Agent": "wb2api-version-checker/1.0"
-                })
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    data = json.loads(response.read().decode('utf-8'))
-                    if "version" in data or "client_version" in data:
-                        versions.update({
-                            "client_version": data.get("client_version", data.get("version", _DEFAULT_CLIENT_VERSION)),
-                            "cli_version": data.get("cli_version", _DEFAULT_CLI_VERSION),
-                            "intl_client_version": data.get("intl_client_version", _DEFAULT_INTL_CLIENT_VERSION),
-                            "intl_cli_version": data.get("intl_cli_version", _DEFAULT_INTL_CLI_VERSION),
-                            "timestamp": int(time.time())
-                        })
-                        return versions
-            except Exception:
-                continue
-    except Exception:
-        pass
+    try:
+        req = urllib.request.Request(cli_url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; wb2api-version-checker/1.0)"
+        })
+        with urllib.request.urlopen(req, timeout=5) as response:
+            cli_ver = _latest_cli_version(response.read().decode("utf-8", errors="ignore"))
+        if cli_ver:
+            versions["cli_version"] = versions["intl_cli_version"] = cli_ver
+            versions["cli_timestamp"] = now
+            versions["cli_checked_date"] = time.strftime("%Y-%m-%d", time.localtime(now))
+    except Exception as e:
+        if DEBUG:
+            log("[指纹] CLI 发布页版本获取失败：%s" % e)
 
-    # 无法获取最新版本，使用默认值
-    if DEBUG:
-        log("[指纹] 无法获取最新版本，使用默认值")
+    stamps = [versions["cn_timestamp"], versions["intl_timestamp"]]
+    versions["timestamp"] = min(stamps) if all(stamps) else 0
+
+    if not any(stamps) and DEBUG:
+        log("[指纹] 在线版本查询失败，继续使用各自回退版本")
     return versions
 
 def _load_cached_versions():
@@ -170,9 +212,33 @@ def _load_cached_versions():
         if os.path.exists(cache_path):
             with open(cache_path, 'r', encoding='utf-8') as f:
                 cached = json.load(f)
-                # 检查缓存是否过期
-                if time.time() - cached.get("timestamp", 0) < _VERSION_CHECK_INTERVAL:
-                    return cached
+                # 不信任旧版共享 timestamp：它可能把单一区域结果伪装成两区缓存。
+                cn_ts = cached.get("cn_timestamp", 0)
+                intl_ts = cached.get("intl_timestamp", 0)
+                cn_ts = cn_ts if isinstance(cn_ts, (int, float)) else 0
+                intl_ts = intl_ts if isinstance(intl_ts, (int, float)) else 0
+                fresh = {}
+                if cn_ts and "client_version" in cached:
+                    fresh["client_version"] = cached["client_version"]
+                    fresh["cn_timestamp"] = cn_ts
+                    fresh["cn_checked_date"] = cached.get("cn_checked_date") or time.strftime(
+                        "%Y-%m-%d", time.localtime(cn_ts))
+                if intl_ts and "intl_client_version" in cached:
+                    fresh["intl_client_version"] = cached["intl_client_version"]
+                    fresh["intl_timestamp"] = intl_ts
+                    fresh["intl_checked_date"] = cached.get("intl_checked_date") or time.strftime(
+                        "%Y-%m-%d", time.localtime(intl_ts))
+                cli_ts = cached.get("cli_timestamp", 0)
+                cli_ts = cli_ts if isinstance(cli_ts, (int, float)) else 0
+                if cli_ts:
+                    fresh.update({k: cached[k] for k in ("cli_version", "intl_cli_version") if k in cached})
+                    fresh["cli_timestamp"] = cli_ts
+                    fresh["cli_checked_date"] = cached.get("cli_checked_date") or time.strftime(
+                        "%Y-%m-%d", time.localtime(cli_ts))
+                if fresh:
+                    fresh["timestamp"] = min(fresh.get("cn_timestamp", time.time()),
+                                              fresh.get("intl_timestamp", time.time()))
+                    return fresh
     except Exception:
         pass
     return None
@@ -204,30 +270,28 @@ def _get_client_versions():
     优先级：环境变量 > 未过期缓存 > 内置默认值。在线查询由后台刷新线程负责，
     这样离线启动和首个请求都不会等待多个版本源超时。
     """
-    if os.environ.get("WB_CLIENT_VERSION"):
-        return {
-            "client_version": os.environ.get("WB_CLIENT_VERSION", _DEFAULT_CLIENT_VERSION),
-            "cli_version": os.environ.get("WB_CLI_VERSION", _DEFAULT_CLI_VERSION),
-            "intl_client_version": os.environ.get("WB_INTL_CLIENT_VERSION", _DEFAULT_INTL_CLIENT_VERSION),
-            "intl_cli_version": os.environ.get("WB_INTL_CLI_VERSION", _DEFAULT_INTL_CLI_VERSION),
-        }
-
     cached = _load_cached_versions()
+    versions = _default_versions()
     if cached:
-        return cached
-    return _default_versions()
+        versions.update(cached)
+    for key, env_name in (("client_version", "WB_CLIENT_VERSION"), ("cli_version", "WB_CLI_VERSION"),
+                          ("intl_client_version", "WB_INTL_CLIENT_VERSION"),
+                          ("intl_cli_version", "WB_INTL_CLI_VERSION")):
+        value = os.environ.get(env_name)
+        if value:
+            versions[key] = value
+    return versions
 
 # 初始化版本（延迟到需要时再获取，避免阻塞启动）
 _versions_cache = None
 
-def _ensure_versions():
+def _ensure_versions(refresh=True):
     """确保版本已初始化。"""
     global _versions_cache
     if _versions_cache is None:
         _versions_cache = _get_client_versions()
-        if not _versions_cache.get("timestamp") and _version_refresh_enabled \
-                and not os.environ.get("WB_CLIENT_VERSION"):
-            # 缓存缺失或过期时先返回内置值，在线查询放到后台完成。
+        if refresh and _version_refresh_enabled and _version_refresh_due(_versions_cache):
+            # 先用当前稳定缓存或回退值启动，版本探测在后台完成。
             _start_version_refresh_thread(refresh_immediately=True)
         # 输出版本信息日志
         if sys.stderr is not None:
@@ -282,13 +346,26 @@ def _version_refresh_worker():
             # 启动后立即刷新一次；之后按缓存有效期等待，缓存缺失时沿用同一重试间隔。
             _version_refresh_wakeup.wait(_VERSION_CHECK_INTERVAL)
             _version_refresh_wakeup.clear()
-            if not os.environ.get("WB_CLIENT_VERSION"):  # 仅在未设置环境变量时自动刷新
+            if _version_refresh_due(_versions_cache or {}):
                 new_versions = _fetch_latest_versions()
-                if new_versions and new_versions.get("timestamp", 0) > (_versions_cache or {}).get("timestamp", 0):
-                    _versions_cache = new_versions
-                    _save_version_cache(new_versions)
+                current = _versions_cache or _default_versions()
+                merged = dict(current)
+                if new_versions.get("cn_timestamp"):
+                    for key in ("client_version", "cn_timestamp", "cn_checked_date"):
+                        merged[key] = new_versions[key]
+                if new_versions.get("intl_timestamp"):
+                    for key in ("intl_client_version", "intl_timestamp", "intl_checked_date"):
+                        merged[key] = new_versions[key]
+                if new_versions.get("cli_timestamp"):
+                    for key in ("cli_version", "intl_cli_version", "cli_timestamp", "cli_checked_date"):
+                        merged[key] = new_versions[key]
+                stamps = (merged.get("cn_timestamp", 0), merged.get("intl_timestamp", 0))
+                merged["timestamp"] = min(stamps) if all(stamps) else 0
+                if any(new_versions.get(key) for key in ("cn_timestamp", "intl_timestamp", "cli_timestamp")):
+                    _versions_cache = merged
+                    _save_version_cache(merged)
                     if DEBUG:
-                        log(f"[指纹] 版本已自动刷新: {new_versions.get('client_version')}")
+                        log("[指纹] 已分别刷新可用地区的版本信息")
                 elif DEBUG:
                     log("[指纹] 版本在线查询失败，继续使用当前版本")
         except Exception as e:
@@ -1949,9 +2026,11 @@ def chat_headers(a: dict) -> dict:
 
     静态部分按 (token, uid, 企业, 域, realm) 缓存，每个请求只补现生成的 ID。
     """
-    key = (a.get("accessToken"), a.get("uid"), a.get("enterpriseId"), a.get("domain"),
-           a.get("realm"), a.get("deviceToken"), UPSTREAM_OVERRIDE)
     intl = is_global(a)
+    version_key = ((get_intl_client_version(), get_intl_cli_version()) if intl
+                   else (get_client_version(), get_cli_version()))
+    key = (a.get("accessToken"), a.get("uid"), a.get("enterpriseId"), a.get("domain"),
+           a.get("realm"), a.get("deviceToken"), UPSTREAM_OVERRIDE, version_key)
     with _chat_static_lock:
         if _chat_static["key"] != key:
             h = common_headers(a)
@@ -6447,7 +6526,7 @@ def main() -> None:
         return
 
     if args.show_version:
-        versions = _ensure_versions()
+        versions = _ensure_versions(refresh=False)
         print("当前客户端版本信息：")
         print("  国内版：WorkBuddy %s (CLI %s)" % (
             versions.get("client_version", _DEFAULT_CLIENT_VERSION),
@@ -6466,9 +6545,25 @@ def main() -> None:
     if args.update_version:
         print("正在检查最新客户端版本...")
         versions = _fetch_latest_versions()
-        fetched = bool(versions.get("timestamp"))
+        fetched = bool(versions.get("cn_timestamp") or versions.get("intl_timestamp")
+                       or versions.get("cli_timestamp"))
         if fetched:
-            _save_version_cache(versions)
+            merged = _load_cached_versions() or _default_versions()
+            for realm, keys in (("cn", ("client_version", "cli_version")),
+                                ("intl", ("intl_client_version", "intl_cli_version"))):
+                stamp_key = realm + "_timestamp"
+                if versions.get(stamp_key):
+                    for key in keys:
+                        merged[key] = versions[key]
+                    merged[stamp_key] = versions[stamp_key]
+                    merged[realm + "_checked_date"] = versions[realm + "_checked_date"]
+            if versions.get("cli_timestamp"):
+                for key in ("cli_version", "intl_cli_version", "cli_timestamp", "cli_checked_date"):
+                    merged[key] = versions[key]
+            stamps = (merged.get("cn_timestamp", 0), merged.get("intl_timestamp", 0))
+            merged["timestamp"] = min(stamps) if all(stamps) else 0
+            _save_version_cache(merged)
+            versions = merged
         print("版本信息已更新：" if fetched else "未能获取最新版本，继续使用内置默认值（未写入缓存）：")
         print("  国内版：WorkBuddy %s (CLI %s)" % (
             versions["client_version"], versions["cli_version"]))
@@ -6486,6 +6581,9 @@ def main() -> None:
             raise SystemExit("找不到凭证文件 %s，请先执行 --login 或 --setup" % AUTH_FILE)
         do_list_models(args.auth)
         return
+
+    # 开始服务前触发当天的版本检查；网络探测在线程中进行，不阻塞启动。
+    _ensure_versions()
 
     # 先绑定端口：端口被占用时立刻给出可读的提示，而不是一长串 traceback
     try:
@@ -6513,9 +6611,6 @@ def main() -> None:
         log("尚未登录（%s 不存在），请打开网页控制台完成登录" % os.path.abspath(AUTH_FILE))
     threading.Thread(target=_refresher_loop, daemon=True, name="token-refresh").start()
     threading.Thread(target=_auto_checkin_loop, daemon=True, name="auto-checkin").start()
-    # 启动版本自动刷新线程
-    _start_version_refresh_thread()
-
     host = "127.0.0.1" if _is_loopback(args.host) or args.host in ("0.0.0.0", "::") \
         else args.host
     base = "http://%s:%d/v1" % (host, args.port)

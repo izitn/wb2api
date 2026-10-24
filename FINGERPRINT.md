@@ -102,17 +102,17 @@ export WB_SYSTEM_TO_USER=1
 ### 1. 版本管理（已实现）
 
 #### 自动版本获取
-- **来源**：从官方客户端发布渠道自动获取最新版本号
-- **缓存机制**：本地缓存 24 小时，避免频繁请求
-- **自动刷新**：后台线程每 24 小时自动检查并更新版本
-- **环境变量覆盖**：允许手动设置固定版本（用于测试或回退）
+- **来源**：官方 WorkBuddy 稳定下载归档与 CLI 发布页；不从含灰度版的更新日志取值
+- **缓存机制**：两个地区分别记录上次成功值和当地日期；官方归档当前没有公布地区不同的 WorkBuddy 稳定版号
+- **自动刷新**：每天首次启动时后台探测，之后运行期间每 24 小时检查；失败后下次启动重试
+- **环境变量覆盖**：四个版本字段可单独设置，未设置的字段仍使用缓存或自动刷新结果
 
 ```bash
-# 手动设置版本（会禁用自动更新）
-export WB_CLIENT_VERSION="5.8.4"
-export WB_CLI_VERSION="2.161.0"
-export WB_INTL_CLIENT_VERSION="5.8.4"
-export WB_INTL_CLI_VERSION="2.161.0"
+# 按实际客户端版本分别设置；只设置需要固定的字段
+export WB_CLIENT_VERSION="<CodeBuddy-version>"
+export WB_CLI_VERSION="<CodeBuddy-CLI-version>"
+export WB_INTL_CLIENT_VERSION="<WorkBuddy-version>"
+export WB_INTL_CLI_VERSION="<WorkBuddy-CLI-version>"
 
 # 禁用版本自动刷新
 export WB_VERSION_AUTO_REFRESH="0"
@@ -134,7 +134,7 @@ python wb2api.py --update-version
 - **随机抖动**：在 ±1 范围内随机调整修订号（例如 5.8.4 → 5.8.3/5.8.4/5.8.5）
 - **目的**：模拟不同用户的客户端更新状态
 
-#### 示例
+#### 历史抓包示例（不代表当前最新版）
 ```
 # 国际版
 WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0
@@ -238,9 +238,9 @@ python wb2api.py --debug
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| `WB_CLIENT_VERSION` | 自动获取 | 国内版客户端版本 |
+| `WB_CLIENT_VERSION` | 自动获取 | 国内版 WorkBuddy 客户端版本 |
 | `WB_CLI_VERSION` | 自动获取 | 国内版 CLI 版本 |
-| `WB_INTL_CLIENT_VERSION` | 自动获取 | 国际版客户端版本 |
+| `WB_INTL_CLIENT_VERSION` | 自动获取 | 国际版 WorkBuddy 客户端版本 |
 | `WB_INTL_CLI_VERSION` | 自动获取 | 国际版 CLI 版本 |
 | `WB_VERSION_AUTO_REFRESH` | `1` | 是否启用版本自动刷新 |
 | `WB_REQUEST_JITTER` | `100` | 请求抖动基准值（ms）|
