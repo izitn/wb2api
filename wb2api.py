@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import functools
 import hashlib
 import hmac
 import http.client
@@ -34,6 +35,7 @@ from html.parser import HTMLParser
 import json
 import math
 import os
+import random
 import re
 import secrets
 import shlex
@@ -72,6 +74,10 @@ _DEFAULT_INTL_CLI_VERSION = "2.162.0"
 # 版本缓存文件路径（相对于数据目录）
 _VERSION_CACHE_FILE = "client_versions.json"
 _VERSION_CHECK_INTERVAL = 86400  # 24小时检查一次
+
+
+def _version_cache_path() -> str:
+    return os.path.join(DATA_DIR, _VERSION_CACHE_FILE)
 
 
 class _VisibleTextParser(HTMLParser):
@@ -124,6 +130,7 @@ def _version_refresh_due(versions, today=None):
         return True
     return False
 
+
 def _fetch_latest_versions():
     """从上游获取最新客户端版本信息。
 
@@ -134,10 +141,6 @@ def _fetch_latest_versions():
 
     返回: dict 包含 {client_version, cli_version, intl_client_version, intl_cli_version, timestamp}
     """
-    import urllib.request
-    import json
-    import re
-
     versions = {
         "client_version": _DEFAULT_CLIENT_VERSION,
         "cli_version": _DEFAULT_CLI_VERSION,
@@ -205,9 +208,10 @@ def _fetch_latest_versions():
         log("[指纹] 在线版本查询失败，继续使用各自回退版本")
     return versions
 
+
 def _load_cached_versions():
     """从本地缓存加载版本信息。"""
-    cache_path = os.path.join(DATA_DIR, _VERSION_CACHE_FILE) if 'DATA_DIR' in globals() else _VERSION_CACHE_FILE
+    cache_path = _version_cache_path()
     try:
         if os.path.exists(cache_path):
             with open(cache_path, 'r', encoding='utf-8') as f:
@@ -243,15 +247,14 @@ def _load_cached_versions():
         pass
     return None
 
+
 def _save_version_cache(versions):
     """保存版本信息到本地缓存。"""
-    cache_path = os.path.join(DATA_DIR, _VERSION_CACHE_FILE) if 'DATA_DIR' in globals() else _VERSION_CACHE_FILE
     try:
-        os.makedirs(os.path.dirname(cache_path) if os.path.dirname(cache_path) else ".", exist_ok=True)
-        with open(cache_path, 'w', encoding='utf-8') as f:
-            json.dump(versions, f, indent=2)
+        _write_private(_version_cache_path(), json.dumps(versions, indent=2))
     except Exception:
         pass
+
 
 def _default_versions(timestamp=0):
     """返回内置版本；timestamp=0 表示这不是一次成功的在线查询。"""
@@ -324,11 +327,14 @@ INTL_CLI_VERSION = os.environ.get("WB_INTL_CLI_VERSION") or None
 def get_client_version():
     return CLIENT_VERSION or _get_version("client_version", _DEFAULT_CLIENT_VERSION)
 
+
 def get_cli_version():
     return CLI_VERSION or _get_version("cli_version", _DEFAULT_CLI_VERSION)
 
+
 def get_intl_client_version():
     return INTL_CLIENT_VERSION or _get_version("intl_client_version", _DEFAULT_INTL_CLIENT_VERSION)
+
 
 def get_intl_cli_version():
     return INTL_CLI_VERSION or _get_version("intl_cli_version", _DEFAULT_INTL_CLI_VERSION)
@@ -371,6 +377,7 @@ def _version_refresh_worker():
         except Exception as e:
             if DEBUG:
                 log(f"[指纹] 版本自动刷新失败: {e}")
+
 
 def _start_version_refresh_thread(refresh_immediately=False):
     """启动版本自动刷新线程。"""
@@ -431,39 +438,117 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
     return max(minimum, value)
 
 
-# --- 指纹特征管理 ---
-# 用于模拟真实客户端行为，降低被检测为机器人的风险
+# --- 请求时序 ---
+# 只随机化网络到达时间；客户端版本、UA 与产品头保持确定性一致。
 
-# 请求时序特征：添加随机抖动，避免规律性
 _FINGERPRINT_REQUEST_JITTER = _env_float("WB_FINGERPRINT_JITTER", 0.2)  # 请求前随机延时 0-0.2 秒
 _FINGERPRINT_ENABLED = os.environ.get("WB_FINGERPRINT_ENABLED", "1") not in ("", "0", "false", "False")
 
 def _apply_request_jitter():
     """在发送请求前应用随机时序抖动。"""
     if _FINGERPRINT_ENABLED and _FINGERPRINT_REQUEST_JITTER > 0:
-        import random
         time.sleep(random.uniform(0, _FINGERPRINT_REQUEST_JITTER))
 
 
+# --- 风控可调项 ---
+# 上游风控盯的是请求节奏，而不是单个请求头：多账号集中请求、批量签到、频繁换号
+# 重试，比少一两个请求头更容易触发 11140。这些参数决定代理对上游的请求节奏，
+# 撞到限制时应当收紧它们，而不是继续调指纹。
+#
+# 默认值只写在这里，下面的模块常量由它派生，避免两处各写一份而漂移。
+# 每项都可用同名环境变量（WB_<KEY>）固定；环境变量存在时网页端只读，因为部署
+# 配置应当优先于界面上的临时改动。其余情况可保存进 settings.json，立即生效。
+_TUNABLES = (
+    {"key": "MAX_INFLIGHT", "kind": "int", "min": 1, "max": 64, "default": 8,
+     "unit": "个", "group": "并发与换号", "label": "同时在途请求上限",
+     "desc": "同一时刻最多并发多少个对话请求。调低可减少同出口的并发突发，是最直接的风控手段。"},
+    {"key": "POOL_MAX_SWITCH", "kind": "int", "min": 0, "max": 10, "default": 3,
+     "unit": "次", "group": "并发与换号", "label": "单请求最多换号",
+     "desc": "一个请求失败后最多换几个账号重试；0 表示完全不换号。"},
+    {"key": "POOL_SWITCH_DELAY", "kind": "float", "min": 0.0, "max": 60.0, "default": 5.0,
+     "unit": "秒", "group": "并发与换号", "label": "换号间隔",
+     "desc": "每次换号前的等待时间，实际取值在该值 ±20% 内随机。"},
+    {"key": "POOL_STICKY_TTL", "kind": "float", "min": 0.0, "max": 86400.0, "default": 1800.0,
+     "unit": "秒", "group": "并发与换号", "label": "会话粘性时长",
+     "desc": "同一会话优先落回同一账号的时长，避免多轮对话在不同账号间跳变。"},
+
+    {"key": "RISK_THRESHOLD", "kind": "int", "min": 1, "max": 20, "default": 2,
+     "unit": "个", "group": "风控波次", "label": "触发暂停的受限账号数",
+     "desc": "统计窗口内出现多少个不同账号受限后，暂停该地区派发。"},
+    {"key": "RISK_WINDOW", "kind": "float", "min": 60.0, "max": 86400.0, "default": 900.0,
+     "unit": "秒", "group": "风控波次", "label": "受限统计窗口",
+     "desc": "统计不同账号受限数量所用的时间窗口。"},
+    {"key": "RISK_PAUSE", "kind": "float", "min": 60.0, "max": 86400.0, "default": 1800.0,
+     "unit": "秒", "group": "风控波次", "label": "波次暂停时长",
+     "desc": "触发波次暂停后，该地区停止派发的时长。"},
+
+    {"key": "POOL_SOFT_COOLDOWN", "kind": "float", "min": 0.0, "max": 86400.0, "default": 600.0,
+     "unit": "秒", "group": "冷却与熔断", "label": "软冷却起点",
+     "desc": "429 等可恢复错误后的初始冷却，之后按指数退避增长。"},
+    {"key": "POOL_SOFT_MAX", "kind": "float", "min": 0.0, "max": 86400.0, "default": 7200.0,
+     "unit": "秒", "group": "冷却与熔断", "label": "软冷却封顶",
+     "desc": "指数退避的冷却上限。"},
+    {"key": "POOL_MODEL_COOLDOWN", "kind": "float", "min": 0.0, "max": 86400.0, "default": 900.0,
+     "unit": "秒", "group": "冷却与熔断", "label": "模型级冷却",
+     "desc": "429/6000（模型限流）只冷却当前模型，不冻结整个账号。"},
+    {"key": "POOL_QUEUE_COOLDOWN", "kind": "float", "min": 0.0, "max": 3600.0, "default": 60.0,
+     "unit": "秒", "group": "冷却与熔断", "label": "渠道排队退避",
+     "desc": "429/6020、6021（渠道排队）后的短退避。"},
+    {"key": "POOL_FAIL_THRESHOLD", "kind": "int", "min": 1, "max": 20, "default": 3,
+     "unit": "次", "group": "冷却与熔断", "label": "熔断失败次数",
+     "desc": "连续失败多少次后熔断该账号。"},
+    {"key": "POOL_BREAKER", "kind": "float", "min": 0.0, "max": 86400.0, "default": 1800.0,
+     "unit": "秒", "group": "冷却与熔断", "label": "熔断时长",
+     "desc": "熔断后该账号停止派发的时长。"},
+
+    {"key": "CHECKIN_GAP_MIN", "kind": "float", "min": 0.0, "max": 3600.0, "default": 45.0,
+     "unit": "秒", "group": "自动签到", "label": "签到最小间隔",
+     "desc": "自动签到排队处理多个账号时，相邻两个账号之间的最短等待。"},
+    {"key": "CHECKIN_GAP_MAX", "kind": "float", "min": 0.0, "max": 3600.0, "default": 180.0,
+     "unit": "秒", "group": "自动签到", "label": "签到最大间隔",
+     "desc": "相邻两个账号之间的最长等待；小于最小间隔时按最小间隔处理。"},
+)
+_TUNABLE_BY_KEY = {item["key"]: item for item in _TUNABLES}
+_TUNABLE_LOCK = threading.Lock()
+
+
+def _tunable_default(key: str):
+    """可调项的默认值：模块常量与网页端共用同一份定义。"""
+    return _TUNABLE_BY_KEY[key]["default"]
+
+
 # --- 账号池 ---
-POOL_SOFT_COOLDOWN = _env_float("WB_POOL_SOFT_COOLDOWN", 600)   # 429 等：指数退避，起点 600s
-POOL_SOFT_MAX = _env_float("WB_POOL_SOFT_MAX", 7200)            # 软冷却封顶
+POOL_SOFT_COOLDOWN = _env_float("WB_POOL_SOFT_COOLDOWN", _tunable_default("POOL_SOFT_COOLDOWN"))
+POOL_SOFT_MAX = _env_float("WB_POOL_SOFT_MAX", _tunable_default("POOL_SOFT_MAX"))
 POOL_HARD_COOLDOWN = _env_float("WB_POOL_HARD_COOLDOWN", 0)     # 0 表示硬错误用默认
-POOL_FAIL_THRESHOLD = _env_int("WB_POOL_FAIL_THRESHOLD", 3, 1)  # 连续失败多少次熔断
-POOL_BREAKER = _env_float("WB_POOL_BREAKER", 1800)
-POOL_STICKY_TTL = _env_float("WB_POOL_STICKY_TTL", 1800)
+POOL_FAIL_THRESHOLD = _env_int("WB_POOL_FAIL_THRESHOLD", _tunable_default("POOL_FAIL_THRESHOLD"), 1)
+POOL_BREAKER = _env_float("WB_POOL_BREAKER", _tunable_default("POOL_BREAKER"))
+POOL_STICKY_TTL = _env_float("WB_POOL_STICKY_TTL", _tunable_default("POOL_STICKY_TTL"))
 POOL_STICKY_MAX = _env_int("WB_POOL_STICKY_MAX", 4096, 1)
-POOL_MAX_SWITCH = _env_int("WB_POOL_MAX_SWITCH", 3)
-POOL_SWITCH_DELAY = _env_float("WB_POOL_SWITCH_DELAY", 5.0)     # 账号切换后的延时（秒），避免过快触发风控
+POOL_MAX_SWITCH = _env_int("WB_POOL_MAX_SWITCH", _tunable_default("POOL_MAX_SWITCH"))
+POOL_SWITCH_DELAY = _env_float("WB_POOL_SWITCH_DELAY", _tunable_default("POOL_SWITCH_DELAY"))
+POOL_MODEL_COOLDOWN = _env_float("WB_POOL_MODEL_COOLDOWN", _tunable_default("POOL_MODEL_COOLDOWN"))
+POOL_QUEUE_COOLDOWN = _env_float("WB_POOL_QUEUE_COOLDOWN", _tunable_default("POOL_QUEUE_COOLDOWN"))
+POOL_AUTH_INCONCLUSIVE = _env_float("WB_POOL_AUTH_INCONCLUSIVE", 120)  # 401 无法求证时的短冷却
+RECHECK_COOLDOWN = _env_float("WB_RECHECK_COOLDOWN", 60)  # 手动受限复查最短间隔
+RISK_WINDOW = _env_float("WB_RISK_WINDOW", _tunable_default("RISK_WINDOW"))
+RISK_PAUSE = _env_float("WB_RISK_PAUSE", _tunable_default("RISK_PAUSE"))
+RISK_THRESHOLD = _env_int("WB_RISK_THRESHOLD", _tunable_default("RISK_THRESHOLD"), 1)
+CHECKIN_GAP_MIN = _env_float("WB_CHECKIN_GAP_MIN", _tunable_default("CHECKIN_GAP_MIN"))
+CHECKIN_GAP_MAX = _env_float("WB_CHECKIN_GAP_MAX", _tunable_default("CHECKIN_GAP_MAX"))
+CHECKIN_WINDOW = _env_int("WB_CHECKIN_WINDOW", 1800, 0, 86400)
+if CHECKIN_GAP_MAX < CHECKIN_GAP_MIN:
+    CHECKIN_GAP_MAX = CHECKIN_GAP_MIN
 
 # --- 请求体与连接 ---
 MAX_BODY = _env_int("WB_MAX_BODY", 16 * 1024 * 1024, 1024 * 1024, 256 * 1024 * 1024)  # 最小 1MB，最大 256MB
-MAX_INFLIGHT = _env_int("WB_MAX_INFLIGHT", 8, 1)   # 同时在途的对话请求上限（降低以避免触发风控）
+MAX_INFLIGHT = _env_int("WB_MAX_INFLIGHT", _tunable_default("MAX_INFLIGHT"), 1)  # 同时在途的对话请求上限
 CLIENT_TIMEOUT = _env_int("WB_CLIENT_TIMEOUT", 120, 30, 3600)  # 下游连接空闲超时（防慢速连接占线程）
 DRAIN_BODY_MAX = _env_int("WB_DRAIN_BODY_MAX", 1024 * 1024, 8192, MAX_BODY)  # chunked 排空上限
 RESP_STORE_MAX = 256      # previous_response_id 内存会话条数
 RESP_STORE_TTL = 6 * 3600
 RESP_STORE_BYTES = 32 * 1024 * 1024  # 会话历史序列化后的总容量上限
+
 DEBUG = os.environ.get("WB_DEBUG", "") not in ("", "0")
 # 大请求体 gzip 后再发上游（实测上游支持；Codex 长上下文 133KB → 41KB）。失败会自动关闭并明文重发
 GZIP_MIN = _env_int("WB_GZIP_MIN", 16384)      # 0 = 关闭
@@ -496,14 +581,17 @@ KEEPALIVE_EVERY = 15      # 上游长时间思考期间，至少每 15 秒给客
 # 上游强制首条消息为 system；客户端没带时补这一条（可用环境变量改）
 DEFAULT_SYSTEM = os.environ.get("WB_DEFAULT_SYSTEM", "You are a helpful assistant.")
 
-# 风控相关配置（2026-10 腾讯加强了内容审核）
-# 是否限制 system 消息长度（避免触发 11140 错误）
-_LIMIT_SYSTEM_LENGTH = os.environ.get("WB_LIMIT_SYSTEM_LENGTH", "1") in ("1", "true", "True", "yes")
+# system 改写默认关闭：这些改写会破坏 Agent 客户端的工具定义与行为约束，
+# 且没有证据表明能稳定降低账号级风控。需要时显式启用兼容模式或单独开关。
+_SYSTEM_COMPAT = (os.environ.get("WB_SYSTEM_COMPAT", "") or "").strip().lower()
+_LIMIT_SYSTEM_LENGTH = os.environ.get(
+    "WB_LIMIT_SYSTEM_LENGTH", "1" if _SYSTEM_COMPAT in ("minimal", "compact") else "0"
+) in ("1", "true", "True", "yes")
 # System 消息最大长度（字节）
-_MAX_SYSTEM_LENGTH = int(os.environ.get("WB_MAX_SYSTEM_LENGTH", "500"))
-# 是否完全移除 system 消息（某些情况下可以绕过检测，但可能影响对话质量）
+_MAX_SYSTEM_LENGTH = _env_int("WB_MAX_SYSTEM_LENGTH", 500, 1)
+# 是否完全移除 system 消息（激进；默认关闭）
 _REMOVE_SYSTEM = os.environ.get("WB_REMOVE_SYSTEM", "0") in ("1", "true", "True", "yes")
-# 是否将过长的 system 转换为首条 user 消息
+# 是否将过长的 system 转换为首条 user 消息（默认关闭）
 _SYSTEM_TO_USER = os.environ.get("WB_SYSTEM_TO_USER", "0") in ("1", "true", "True", "yes")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -522,6 +610,7 @@ API_KEY_FILE = _data_path("WB_API_KEY_FILE", "api_key.txt")
 SELECTION_FILE = _data_path("WB_SELECTION_FILE", "selection.json")
 USAGE_FILE = _data_path("WB_USAGE_FILE", "usage.jsonl")
 MODELS_CACHE_FILE = _data_path("WB_MODELS_CACHE_FILE", "models_cache.json")
+RISK_STATE_FILE = _data_path("WB_RISK_STATE_FILE", "risk_state.json")
 
 _lock = threading.RLock()
 _private_write_locks = tuple(threading.Lock() for _ in range(64))
@@ -560,6 +649,7 @@ _started_at = time.time()
 _points_lock = threading.RLock()
 _points_state: dict[str, dict] = {}
 _checkin_locks: dict[str, threading.Lock] = {}
+_checkin_gate = threading.BoundedSemaphore(1)  # 所有签到请求共享的上游闸门
 _auto_checkin = False
 _settings_lock = threading.Lock()
 _checkin_wake = threading.Event()
@@ -576,7 +666,16 @@ _pool_health: dict[str, dict] = {}
 # 会话粘性：会话键 → (账号 id, 过期时间)。同一对话尽量落在同一账号，
 # 既符合官方客户端"一个会话一台设备"的语义，也避免多轮上下文在两个池成员间跳变。
 _pool_sticky: dict[str, tuple[str, float]] = {}
-_pool_stats = {"switch": 0, "exhausted": 0}
+_pool_stats = {"switch": 0, "exhausted": 0, "restricted": 0, "wavePauses": 0}
+# 风控波次：同一 realm 在窗口内出现多个不同账号的 11140 后，暂停该区域派发。
+_pool_risk_events: dict[str, collections.deque] = {
+    realm: collections.deque(maxlen=256) for realm in REALMS
+}
+_pool_risk_waves: dict[str, dict] = {
+    realm: {"pausedUntil": 0.0, "reason": ""} for realm in REALMS
+}
+_pool_channel_pauses: dict[str, dict] = {}
+_risk_state_loaded = False
 
 
 def settings_file() -> str:
@@ -584,6 +683,11 @@ def settings_file() -> str:
 
 
 def load_settings() -> None:
+    """读取 settings.json；自动签到与风控可调项共用同一个文件。
+
+    整个文件只有一个写者（本模块的 set_* 函数），且都走「读-改-写」，
+    因此新增一类设置不会把另一类抹掉。
+    """
     global _auto_checkin
     with _settings_lock:
         try:
@@ -592,18 +696,148 @@ def load_settings() -> None:
         except FileNotFoundError:
             _auto_checkin = False
             return
-        if not isinstance(cfg, dict) or not isinstance(cfg.get("autoCheckin", False), bool):
+        if not isinstance(cfg, dict):
+            raise ValueError("设置文件格式不正确")
+        # 缺键视为关闭；键存在但不是布尔值才算格式错误。
+        enabled = cfg.get("autoCheckin", False)
+        if not isinstance(enabled, bool):
             raise ValueError("自动签到设置格式不正确")
-        _auto_checkin = cfg.get("autoCheckin", False)
+        _auto_checkin = enabled
+        _apply_tunables_locked(cfg.get("tunables"))
+
+
+def _read_settings_locked() -> dict:
+    """读取现有设置；损坏时按空配置继续，不能让面板保存失败在旧文件上。"""
+    try:
+        with open(settings_file(), encoding="utf-8") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _write_settings_locked(cfg: dict) -> None:
+    _write_private(settings_file(), json.dumps(cfg, ensure_ascii=False, indent=2))
 
 
 def set_auto_checkin(enabled: bool) -> dict:
     global _auto_checkin
     with _settings_lock:
-        _write_private(settings_file(), json.dumps({"autoCheckin": enabled}, ensure_ascii=False, indent=2))
+        cfg = _read_settings_locked()      # 读-改-写：不覆盖 tunables
+        cfg["autoCheckin"] = enabled
+        _write_settings_locked(cfg)
         _auto_checkin = enabled
     _checkin_wake.set()
     return {"ok": True, "autoCheckin": enabled, "message": "已开启每日自动签到" if enabled else "已关闭每日自动签到"}
+
+
+def _coerce_tunable(key: str, value):
+    """把网页/文件里的值收敛到声明的类型与范围内；无法识别时抛 ValueError。"""
+    spec = _TUNABLE_BY_KEY.get(key)
+    if spec is None:
+        raise ValueError("未知设置项：%s" % key)
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("%s 必须是数字" % spec["label"])
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("%s 必须是数字" % spec["label"])
+    if not math.isfinite(number):
+        raise ValueError("%s 必须是有限数字" % spec["label"])
+    if spec["kind"] == "int":
+        if number != int(number):
+            raise ValueError("%s 必须是整数" % spec["label"])
+        number = int(number)
+    if number < spec["min"] or number > spec["max"]:
+        raise ValueError("%s 必须在 %s ~ %s 之间"
+                         % (spec["label"], spec["min"], spec["max"]))
+    return number
+
+
+def _apply_tunable(key: str, value) -> None:
+    """写入模块常量。并发上限需要重建信号量，否则改值不会真正生效。"""
+    global MAX_INFLIGHT, _slots
+    if key == "MAX_INFLIGHT":
+        MAX_INFLIGHT = int(value)
+        _slots = threading.BoundedSemaphore(MAX_INFLIGHT)
+        return
+    globals()[key] = value
+
+
+def _apply_tunables_locked(saved) -> None:
+    """应用已保存的可调项；环境变量固定的项以环境变量为准，直接跳过。
+
+    逐项独立处理：某一项损坏只影响它自己，不让整个设置文件失效。
+    """
+    if not isinstance(saved, dict):
+        return
+    for key, value in saved.items():
+        if key not in _TUNABLE_BY_KEY or _tunable_env_name(key) in os.environ:
+            continue
+        try:
+            _apply_tunable(key, _coerce_tunable(key, value))
+        except ValueError as e:
+            log("设置项 %s 无法应用，沿用当前值：%s" % (key, e))
+    if CHECKIN_GAP_MAX < CHECKIN_GAP_MIN:
+        globals()["CHECKIN_GAP_MAX"] = CHECKIN_GAP_MIN
+
+
+def _tunable_env_name(key: str) -> str:
+    return "WB_" + key
+
+
+def tunables_state() -> list:
+    """供网页渲染的可调项清单：当前值、默认值、范围、以及是否被环境变量固定。"""
+    out = []
+    for spec in _TUNABLES:
+        key = spec["key"]
+        env_name = _tunable_env_name(key)
+        out.append({
+            "key": key,
+            "group": spec["group"],
+            "label": spec["label"],
+            "desc": spec["desc"],
+            "unit": spec["unit"],
+            "kind": spec["kind"],
+            "min": spec["min"],
+            "max": spec["max"],
+            "default": spec["default"],
+            "value": globals().get(key, spec["default"]),
+            # 环境变量存在时只读：部署配置优先于界面上的临时改动
+            "envLocked": env_name in os.environ,
+            "envName": env_name,
+        })
+    return out
+
+
+def set_tunables(patch) -> dict:
+    """保存若干可调项并立即生效。返回保存后的完整清单。"""
+    if not isinstance(patch, dict) or not patch:
+        raise ValueError("需要提供要修改的设置项")
+    applied = {}
+    with _TUNABLE_LOCK, _settings_lock:
+        for key, value in patch.items():
+            if key not in _TUNABLE_BY_KEY:
+                raise ValueError("未知设置项：%s" % key)
+            if _tunable_env_name(key) in os.environ:
+                raise ValueError("%s 已由环境变量 %s 固定，无法在界面修改"
+                                 % (_TUNABLE_BY_KEY[key]["label"], _tunable_env_name(key)))
+            applied[key] = _coerce_tunable(key, value)
+        # 先写盘再改内存：写失败时内存保持原值，避免界面显示已生效
+        cfg = _read_settings_locked()
+        stored = cfg.get("tunables")
+        stored = dict(stored) if isinstance(stored, dict) else {}
+        stored.update(applied)
+        cfg["tunables"] = stored
+        _write_settings_locked(cfg)
+        for key, value in applied.items():
+            _apply_tunable(key, value)
+        if CHECKIN_GAP_MAX < CHECKIN_GAP_MIN:
+            globals()["CHECKIN_GAP_MAX"] = CHECKIN_GAP_MIN
+    return {"ok": True, "tunables": tunables_state(),
+            "message": "已保存 %d 项设置，立即生效" % len(applied)}
 
 
 def _billing_base(a: dict) -> str:
@@ -678,7 +912,8 @@ def _billing_post(a: dict, path: str, body: dict | None = None):
             raise BillingError(resp.status, -1, "积分服务响应格式不正确")
         code = str(payload.get("code", 0 if "data" in payload or "Response" in payload else -1))
         message = str(payload.get("message") or payload.get("msg") or "积分服务返回错误码 %s" % code)
-        unauthorized = resp.status in (401, 403) or code in ("401", "403")
+        restricted = code == "11140" or (resp.status == 403 and "11140" in message)
+        unauthorized = (resp.status in (401, 403) or code in ("401", "403")) and not restricted
         if unauthorized and not refreshed and a.get("refreshToken"):
             refreshed = True
             if refresh_auth(a, stale_token=a.get("accessToken")):
@@ -947,11 +1182,41 @@ def _billing_post_checkin(a: dict) -> None:
         raise last
 
 
+def _checkin_skip(a: dict, aid: str, waited: bool = False) -> dict | None:
+    """签到闸门：账号池退避或账号受限/冷却时返回跳过结果，否则返回 None。
+
+    waited=True 表示已经排队等到闸门，提示语要说明是等待期间状态变化。
+    """
+    pause = _risk_pause_status(realm_of(a))
+    if pause.get("paused"):
+        if waited:
+            message = "等待期间账号池进入退避期，已跳过签到"
+        else:
+            reason = "渠道排队退避" if pause.get("reason") == "queue" else "风控暂停"
+            message = "账号池处于%s期，已跳过签到（剩余 %d 分钟）" % (
+                reason, max(1, int(math.ceil(pause.get("remaining", 0) / 60))))
+        return {"accountId": aid, "checkin": False, "checkinSupported": True,
+                "checkinRiskPaused": True, "checkinMessage": message}
+    if not _pool_available(aid):
+        restricted = bool(_health(aid).get("restricted"))
+        if waited:
+            message = "等待期间账号受限或冷却，已跳过签到"
+        else:
+            message = "账号当前受限，已跳过签到" if restricted else "账号正在冷却，已跳过签到"
+        return {"accountId": aid, "checkin": False, "checkinSupported": True,
+                "checkinRestricted": restricted, "checkinSkipped": True,
+                "checkinMessage": message}
+    return None
+
+
 def daily_checkin(a: dict) -> dict:
     aid = account_id(a)
     if not _supports_checkin(a):
         return _update_points(aid, {"accountId": aid, "checkin": False, "checkinSupported": False,
             "checkinMessage": "仅国内版个人账号支持每日签到"})
+    skipped = _checkin_skip(a, aid)
+    if skipped:
+        return _update_points(aid, skipped)
     with _points_lock:
         mutex = _checkin_locks.setdefault(aid, threading.Lock())
     with mutex:
@@ -960,29 +1225,50 @@ def daily_checkin(a: dict) -> dict:
             old = dict(_points_state.get(aid) or {})
         if old.get("checkinDay") == today and old.get("checkin") is True:
             return old
-        patch = {"accountId": aid, "checkinSupported": True, "lastCheckinAttempt": time.time()}
-        try:
-            status = _billing_fallback(a, ["/v2/billing/meter/checkin-activity-status",
-                                          "/v2/billing/meter/checkin-status"])
-            if not isinstance(status, dict):
-                raise RuntimeError("签到状态格式无法识别")
-            if status.get("active") is False:
-                raise RuntimeError("当前签到活动未开放")
-            checked = status.get("today_checked_in", status.get("todayCheckedIn"))
-            if not isinstance(checked, bool):
-                raise RuntimeError("签到状态缺少今日是否签到字段")
-            already = checked
-            if not checked:
-                try:
-                    _billing_post_checkin(a)
-                except BillingError as e:
-                    if _checkin_already(e):
-                        already = True
-                    else:
-                        raise
-            patch.update(checkin=True, checkinDay=today, checkinMessage="今日已签到" if already else "签到成功，已领取今日积分")
-        except Exception as e:
-            patch.update(checkin=False, checkinMessage="签到失败：" + str(e))
+        with _checkin_gate:
+            skipped = _checkin_skip(a, aid, waited=True)
+            if skipped:
+                return _update_points(aid, skipped)
+            patch = {"accountId": aid, "checkinSupported": True,
+                     "lastCheckinAttempt": time.time(), "checkinRiskPaused": False,
+                     "checkinRestricted": False, "checkinErrorClass": "",
+                     "checkinErrorCode": None}
+            try:
+                status = _billing_fallback(a, ["/v2/billing/meter/checkin-activity-status",
+                                              "/v2/billing/meter/checkin-status"])
+                if not isinstance(status, dict):
+                    raise RuntimeError("签到状态格式无法识别")
+                if status.get("active") is False:
+                    raise RuntimeError("当前签到活动未开放")
+                checked = status.get("today_checked_in", status.get("todayCheckedIn"))
+                if not isinstance(checked, bool):
+                    raise RuntimeError("签到状态缺少今日是否签到字段")
+                already = checked
+                if not checked:
+                    try:
+                        _billing_post_checkin(a)
+                    except BillingError as e:
+                        if _checkin_already(e):
+                            already = True
+                        else:
+                            raise
+                patch.update(checkin=True, checkinDay=today,
+                             checkinMessage="今日已签到" if already else "签到成功，已领取今日积分")
+            except Exception as e:
+                failure = classify_upstream_failure(
+                    getattr(e, "status", 502) or 502,
+                    getattr(e, "code", None), str(e))
+                if failure.get("kind") == "restricted":
+                    _pool_record_failure(a, failure)
+                    patch.update(checkinRestricted=True,
+                                 checkinErrorClass="restricted",
+                                 checkinErrorCode=failure.get("code") or 11140,
+                                 checkin=False,
+                                 checkinMessage="签到失败：账号存在异常行为，已被限制使用")
+                else:
+                    patch.update(checkin=False, checkinMessage="签到失败：" + str(e),
+                                 checkinErrorClass=failure.get("kind"),
+                                 checkinErrorCode=failure.get("code"))
         out = _update_points(aid, patch)
         if out.get("checkin"):
             # 先排空签到前的查询，确保新余额不会复用领积分前的结果。
@@ -991,16 +1277,26 @@ def daily_checkin(a: dict) -> dict:
         return out
 
 
+def _checkin_window_open(now: float | None = None) -> bool:
+    """把每日签到起点按日期散列到窗口内，避免所有实例在零点同时请求。"""
+    if CHECKIN_WINDOW <= 0:
+        return True
+    now = time.time() if now is None else now
+    day = _checkin_day()
+    offset = int.from_bytes(hashlib.sha256(("checkin:" + day).encode("utf-8")).digest()[:4],
+                            "big") % CHECKIN_WINDOW
+    return int((now + 8 * 3600) % 86400) >= offset
+
+
 def _run_auto_checkin_cycle():
-    if not _auto_checkin:
+    if not _auto_checkin or not _checkin_window_open():
         return
     with _lock:
         accounts = dict(_accounts)
         if _auth:
             accounts[account_id(_auth)] = _auth
+    eligible = []
     for aid, a in accounts.items():
-        if not _auto_checkin:
-            break
         if not _supports_checkin(a):
             continue
         with _points_lock:
@@ -1009,8 +1305,36 @@ def _run_auto_checkin_cycle():
             continue
         if time.time() - state.get("lastCheckinAttempt", 0) < 1800:
             continue
+        eligible.append((aid, a))
+    random.shuffle(eligible)
+    attempted = 0
+    for index, (aid, a) in enumerate(eligible):
+        if not _auto_checkin:
+            break
+        pause = _risk_pause_status(realm_of(a))
+        if pause.get("paused"):
+            log("自动签到：%s 处于退避期，取消本轮剩余 %d 个账号" %
+                (REALMS[realm_of(a)]["label"], len(eligible) - index))
+            break
+        if not _pool_available(aid):
+            log("自动签到：%s 已受限或冷却，跳过" % (account_name(a) or aid[:8]))
+            continue
+        if attempted:
+            delay = random.uniform(CHECKIN_GAP_MIN, CHECKIN_GAP_MAX)
+            if delay > 0:
+                log("自动签到：等待 %.0f 秒后处理下一个账号" % delay)
+                time.sleep(delay)
+        if not _auto_checkin:
+            break
+        if _risk_pause_status(realm_of(a)).get("paused") or not _pool_available(aid):
+            log("自动签到：等待期间账号池状态变化，取消本轮剩余账号")
+            break
+        attempted += 1
         result = daily_checkin(a)
         log("自动签到：%s，%s" % (account_name(a) or "未命名账号", result.get("checkinMessage", "")))
+        if result.get("checkinRestricted") or result.get("checkinRiskPaused"):
+            log("自动签到：检测到账号受限，取消本轮剩余账号")
+            break
 
 
 def _auto_checkin_loop():
@@ -1254,6 +1578,11 @@ def to_int(v) -> int:
         return 0
 
 
+def _seconds_left(until: float, now: float, minimum: int = 0) -> int:
+    """剩余整秒数：向上取整，避免显示「还剩 0 秒」却仍在冷却。"""
+    return max(minimum, int(math.ceil(float(until or 0.0) - now)))
+
+
 # ===========================================================================
 # 三、凭证：加载 / 保存 / 刷新
 # ===========================================================================
@@ -1381,7 +1710,7 @@ def save_auth(a: dict) -> None:
 def activate_account(a: dict) -> dict:
     """持久化成功后原子切换内存指针；在途请求保留其原有账号引用。"""
     global _accounts, _auth
-    global _selection, _selection_owner, _account_selections, _selection_scoped, _selection_mtime
+    global _selection, _selection_owner, _account_selections, _selection_scoped
     with _lock:
         reload_selection_if_changed()
         accounts = dict(_accounts)
@@ -1399,8 +1728,7 @@ def activate_account(a: dict) -> dict:
                            "aliases": dict(_aliases), "default_model": _default_model, "enforce": _enforce,
                            "accountUseOwnModels": dict(_account_use_own_models),
                            "pools": _pools_payload()}
-                _write_private(SELECTION_FILE, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-                _selection_mtime = os.path.getmtime(SELECTION_FILE)
+                _write_selection_file(payload)
                 _selection_scoped = True
             _save_accounts(accounts, a)
             _accounts, _auth = accounts, a
@@ -1425,6 +1753,13 @@ def account_summary(a: dict) -> dict:
             "displayName": account_name(a) or "未命名账号", "uid": a.get("uid") or "",
             "realm": realm_of(a), "enterpriseId": a.get("enterpriseId") or "",
             "domain": a.get("domain") or "", "expiresAt": a.get("expiresAt") or 0}
+
+
+def _write_selection_file(payload: dict) -> None:
+    """写 selection.json 并记录 mtime；两处保存路径共用同一序列化格式。"""
+    global _selection_mtime
+    _write_private(SELECTION_FILE, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    _selection_mtime = os.path.getmtime(SELECTION_FILE)
 
 
 def _write_private(path: str, text: str) -> None:
@@ -1452,52 +1787,112 @@ def _write_private(path: str, text: str) -> None:
                 pass
 
 
-def _refresh_unlocked(a: dict) -> bool:
-    """刷新 access token。refresh 响应里 accessToken/refreshToken 总是一起轮换。
-    调用方必须持有该账号的刷新锁；网络等待不占用账号切换锁。"""
+REFRESH_ALIVE = "alive"
+REFRESH_DEAD = "dead"
+REFRESH_INCONCLUSIVE = "inconclusive"
+REFRESH_RESTRICTED = "restricted"
+
+
+def _refresh_failure_state(status: int, payload, raw: str) -> str:
+    """把 refresh 响应分成可重试、已失效和账号受限，避免把边缘拦截误判成死号。"""
+    meta = _error_log_metadata(payload) if isinstance(payload, dict) else {}
+    # 保留 None：to_int(None) == 0 会让下面的「有业务码才判死」永远成立。
+    code = meta.get("code")
+    text = ""
+    if isinstance(payload, dict):
+        text = str(payload.get("message") or payload.get("msg") or "")
+    text = (text + " " + raw[:500]).lower()
+    if status == 403 and (to_int(code) == 11140 or "11140" in text or "unusual activity" in text):
+        return REFRESH_RESTRICTED
+    dead_markers = ("invalid_grant", "invalid grant", "invalid_token", "invalid token",
+                    "user disabled", "account disabled", "token expired", "token 已失效",
+                    "登录已过期", "账号已停用")
+    if any(marker in text for marker in dead_markers):
+        return REFRESH_DEAD
+    if status in (400, 401, 403) and code is not None:
+        # 明确的 4xx 业务信封才判死；HTML/空响应可能是 CDN/边缘层瞬时拦截。
+        return REFRESH_DEAD
+    return REFRESH_INCONCLUSIVE
+
+
+def _refresh_unlocked(a: dict) -> str:
+    """刷新 access token，返回 alive/dead/inconclusive/restricted。
+
+    refresh 端点也可能先被边缘层拦截为 HTML 或 5xx；这类结果只允许
+    短冷却与单次重试，不能直接禁用账号。
+    """
+    a.pop("_lastRefreshState", None)
+
+    def result(state: str, backoff: bool) -> str:
+        a["_lastRefreshOk"] = state == REFRESH_ALIVE
+        a["_lastRefreshState"] = state
+        if backoff:
+            _refresh_failures[account_id(a)] = time.time()
+        return state
+
     if not a.get("refreshToken"):
-        return False
+        return result(REFRESH_DEAD, False)
     aid = account_id(a)
     if time.time() - _refresh_failures.get(aid, 0.0) < REFRESH_BACKOFF:
-        return False
+        return result(REFRESH_INCONCLUSIVE, False)
     h = common_headers(a)
     h["X-Refresh-Token"] = a["refreshToken"]
     h["X-Auth-Refresh-Source"] = "plugin"
     try:
-        tok = http_json("POST", upstream_base(a) + REFRESH_PATH, h, b"", timeout=30)
+        resp = upstream_request("POST", upstream_base(a) + REFRESH_PATH, h, b"", 30)
+        try:
+            status = resp.status
+            raw_bytes = resp.read()
+            content_type = str(resp.headers.get("Content-Type") or "").lower()
+        finally:
+            resp.close()
     except Exception as e:  # noqa: BLE001 - 刷新失败不应打断请求，交由调用方降级
-        log("登录令牌刷新失败：%s" % e)
-        _refresh_failures[aid] = time.time()
-        a["_lastRefreshOk"] = False
-        return False
+        log("登录令牌刷新失败（无法求证）：%s" % e)
+        return result(REFRESH_INCONCLUSIVE, True)
+
+    raw = raw_bytes.decode("utf-8", "replace")
+    payload = None
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeError):
+        pass
+    if status >= 500 or status == 429:
+        return result(REFRESH_INCONCLUSIVE, True)
+    if status >= 400:
+        # HTML/空响应可能是 CDN/边缘层瞬时拦截，只有 200 之后的响应才带完整诊断信息。
+        detail = raw if "html" not in content_type else raw[:200]
+        return result(_refresh_failure_state(status, payload, detail), True)
+
+    tok = payload
     # 兼容裸对象与 {code,msg,data} 信封两种形态
     if isinstance(tok, dict) and isinstance(tok.get("data"), dict) and not tok.get("accessToken"):
         tok = tok["data"]
     if not isinstance(tok, dict) or not tok.get("accessToken"):
-        log("登录令牌刷新响应缺少 accessToken —— 需要重新登录")
-        _refresh_failures[aid] = time.time()
-        a["_lastRefreshOk"] = False
-        return False
+        state = _refresh_failure_state(status, payload, raw)
+        return result(state, state == REFRESH_INCONCLUSIVE)
+
     _refresh_failures.pop(aid, None)
     with _lock:
         current = _accounts.get(aid)
         if current is not None and current is not a:
             # 此账号在网络等待期间重新登录了，旧刷新结果不能覆盖新授权。
             a.update(current)
-            return True
+            a["_lastRefreshState"] = REFRESH_ALIVE
+            return REFRESH_ALIVE
         a["accessToken"] = tok["accessToken"]
         a["_lastRefreshOk"] = True
+        a["_lastRefreshState"] = REFRESH_ALIVE
         if tok.get("refreshToken"):
             a["refreshToken"] = tok["refreshToken"]
         if to_int(tok.get("expiresIn")) > 0:
             a["expiresAt"] = int(time.time()) + to_int(tok["expiresIn"])
         save_auth(a)
     log("登录令牌已刷新，新到期时间 %s" % time.strftime("%Y-%m-%d %H:%M", time.localtime(a["expiresAt"])))
-    return True
+    return REFRESH_ALIVE
 
 
-def refresh_auth(a: dict, stale_token: str | None = None) -> bool:
-    """加锁刷新。传入 stale_token 时，若别的线程已经换过 token 就直接复用。"""
+def refresh_auth_state(a: dict, stale_token: str | None = None) -> str:
+    """加锁刷新并返回四态结果；调用方据此决定是否允许换号。"""
     with _lock:
         mutex = _refresh_locks.setdefault(account_id(a), threading.Lock())
     with mutex:
@@ -1506,11 +1901,16 @@ def refresh_auth(a: dict, stale_token: str | None = None) -> bool:
         if stale_token is not None and current.get("accessToken") != stale_token:
             if current is not a:
                 a.update(current)
-            return True
+            return REFRESH_ALIVE
         result = _refresh_unlocked(current)
         if current is not a:
             a.update(current)
         return result
+
+
+def refresh_auth(a: dict, stale_token: str | None = None) -> bool:
+    """兼容旧调用方的布尔版本；只有明确成功才返回 True。"""
+    return refresh_auth_state(a, stale_token) == REFRESH_ALIVE
 
 
 def ensure_auth() -> dict:
@@ -1565,56 +1965,360 @@ def _pool_member(aid: str, realm: str | None = None) -> dict | None:
     return a
 
 
+def _health_defaults() -> dict:
+    return {
+        "cooldownUntil": 0.0,
+        "fails": 0,
+        "breakerUntil": 0.0,
+        "lastError": "",
+        "lastErrorClass": "",
+        "lastErrorCode": None,
+        "lastRequestId": "",
+        "lastFailureAt": 0.0,
+        "softCount": 0,
+        "restricted": False,
+        "restrictedAt": 0.0,
+        "restrictionCode": None,
+        "lastRecheckAt": 0.0,
+        "modelCooldowns": {},
+    }
+
+
 def _health(aid: str) -> dict:
     with _pool_lock:
         h = _pool_health.get(aid)
         if h is None:
-            h = {"cooldownUntil": 0.0, "fails": 0, "breakerUntil": 0.0, "lastError": "", "softCount": 0}
+            h = _health_defaults()
             _pool_health[aid] = h
+        else:
+            # 兼容本版本之前只在内存中存在的旧健康记录。
+            for key, value in _health_defaults().items():
+                h.setdefault(key, value)
         return h
+
+
+def classify_upstream_failure(status: int, code=None, message: str = "",
+                              retry_after: str = "", request_id: str = "",
+                              auth_state: str = "") -> dict:
+    """把上游失败分成请求级、账号级和限流级，供账号池与日志共同使用。"""
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        status = 502
+    code_i = to_int(code)
+    text = str(message or "").lower()
+    ra = to_int(retry_after)
+
+    def failure(kind: str, label: str, **overrides) -> dict:
+        out = {"kind": kind, "label": label, "switch": False,
+               "accountCooldown": 0.0, "breaker": False,
+               "channelPause": 0.0, "restricted": False, "code": code_i,
+               "requestId": request_id, "retryAfter": ra}
+        out.update(overrides)
+        return out
+
+    restricted_markers = (
+        "unusual activity", "account has been restricted", "account restricted",
+        "账号存在异常", "已被限制使用", "账号异常", "账号封禁",
+    )
+    if (auth_state == REFRESH_RESTRICTED
+            or code_i == 11140
+            or (status == 403 and (any(marker in text for marker in restricted_markers)
+                                   or "11140" in text or "request illegal" in text))):
+        return failure("restricted", "账号受限", restricted=True)
+
+    if (code_i == 11128
+            or "11128" in text
+            or "unapproved channel" in text
+            or "conversation id missing" in text
+            or "渠道校验" in text
+            or (status == 400 and "request illegal" in text)):
+        return failure("channel_check", "渠道校验失败")
+
+    if auth_state == REFRESH_DEAD:
+        return failure("auth_dead", "授权已失效", switch=True,
+                       accountCooldown=POOL_SOFT_COOLDOWN)
+    if auth_state == REFRESH_INCONCLUSIVE:
+        return failure("auth_inconclusive", "授权状态不确定",
+                       accountCooldown=POOL_AUTH_INCONCLUSIVE)
+
+    if status == 429:
+        if code_i == 6000 or "switch to another model" in text or "切换其他模型" in text:
+            return failure("model_limit", "模型级限流")
+        if code_i in (6020, 6021) or "queue.waiting" in text or "queue waiting" in text \
+                or "排队" in text:
+            return failure("queue", "渠道排队",
+                           channelPause=max(POOL_QUEUE_COOLDOWN, float(ra or 0)))
+        if code_i == 10105 or "active session" in text or "活跃会话" in text:
+            return failure("session_limit", "活跃会话达上限")
+        return failure("rate_limit", "账号或出口限流", switch=True,
+                       accountCooldown=max(POOL_SOFT_COOLDOWN, float(ra or 0)))
+
+    if status == 401:
+        return failure("auth_dead", "授权已失效", switch=True,
+                       accountCooldown=POOL_SOFT_COOLDOWN)
+    if status == 402:
+        return failure("balance", "余额或积分不足", switch=True,
+                       accountCooldown=POOL_HARD_COOLDOWN or 3600.0)
+    if status == 403:
+        return failure("permission", "权限拒绝", switch=True,
+                       accountCooldown=POOL_SOFT_COOLDOWN)
+    if status >= 500:
+        return failure("transient", "上游暂时不可用", switch=True, breaker=True)
+    return failure("request_error", "请求错误")
+
+
+def _risk_pause_status(realm: str) -> dict:
+    now = time.time()
+    with _pool_lock:
+        wave = _pool_risk_waves.get(realm) or {}
+        channel = _pool_channel_pauses.get(realm) or {}
+        wave_until = float(wave.get("pausedUntil") or 0.0)
+        channel_until = float(channel.get("pausedUntil") or 0.0)
+        until = max(wave_until, channel_until)
+        reason = ""
+        if until > now:
+            reason = "restricted-wave" if wave_until >= channel_until else "queue"
+        return {
+            "paused": until > now,
+            "pausedUntil": until,
+            "remaining": _seconds_left(until, now),
+            "reason": reason,
+            "windowSeconds": int(RISK_WINDOW),
+            "threshold": RISK_THRESHOLD,
+            "lastRestrictedAt": float(wave.get("lastRestrictedAt") or 0.0),
+        }
+
+
+def _risk_state_payload_locked() -> dict:
+    accounts = {}
+    for aid, h in _pool_health.items():
+        if h.get("restricted"):
+            accounts[aid] = {"restrictedAt": float(h.get("restrictedAt") or 0.0),
+                             "restrictionCode": h.get("restrictionCode")}
+    now = time.time()
+    waves = {}
+    for realm, entry in _pool_risk_waves.items():
+        until = float(entry.get("pausedUntil") or 0.0)
+        if until <= now:
+            continue
+        waves[realm] = {"pausedUntil": until,
+                        "reason": str(entry.get("reason") or ""),
+                        "lastRestrictedAt": float(entry.get("lastRestrictedAt") or 0.0)}
+    cutoff = now - RISK_WINDOW
+    events = {}
+    for realm, queue in _pool_risk_events.items():
+        recent = [[float(ts), aid] for ts, aid in queue if float(ts) >= cutoff]
+        if recent:
+            events[realm] = recent
+    return {"version": 1, "accounts": accounts, "waves": waves, "events": events}
+
+
+def _save_risk_state() -> None:
+    with _pool_lock:
+        payload = _risk_state_payload_locked()
+    try:
+        _write_private(RISK_STATE_FILE, json.dumps(payload, ensure_ascii=False, indent=2))
+    except OSError as e:
+        log("风控状态保存失败：%s" % e)
+
+
+def _risk_float(value) -> float:
+    """风控状态里的时间戳来自磁盘，损坏或手改时降级为 0 而不是让启动崩溃。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def load_risk_state() -> None:
+    """恢复受限账号和尚未结束的风控暂停；文件损坏时安全降级为空状态。"""
+    global _risk_state_loaded
+    if _risk_state_loaded:
+        return
+    try:
+        with open(RISK_STATE_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            raise ValueError("风控状态必须是对象")
+        saved_accounts = raw.get("accounts") or {}
+        saved_waves = raw.get("waves") or {}
+        saved_events = raw.get("events") or {}
+        if not isinstance(saved_accounts, dict) or not isinstance(saved_waves, dict) \
+                or not isinstance(saved_events, dict):
+            raise ValueError("风控状态结构不正确")
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError, TypeError) as e:
+        log("风控状态读取失败，按空状态继续：%s" % e)
+        return
+    finally:
+        _risk_state_loaded = True
+
+    now = time.time()
+    cutoff = now - RISK_WINDOW
+    with _pool_lock:
+        for aid, saved in saved_accounts.items():
+            if not isinstance(aid, str) or not isinstance(saved, dict):
+                continue
+            h = _health(aid)
+            code = saved.get("restrictionCode")
+            h["restricted"] = True
+            h["restrictedAt"] = _risk_float(saved.get("restrictedAt"))
+            h["restrictionCode"] = to_int(code) if code is not None else 11140
+            h["lastErrorClass"] = "restricted"
+            h["lastErrorCode"] = h["restrictionCode"]
+        for realm, saved in saved_events.items():
+            if realm not in REALMS or not isinstance(saved, list):
+                continue
+            queue = _pool_risk_events.setdefault(realm, collections.deque(maxlen=256))
+            queue.clear()
+            for item in saved[-256:]:
+                if not isinstance(item, list) or len(item) != 2:
+                    continue
+                ts, aid = item
+                if isinstance(aid, str) and _risk_float(ts) >= cutoff:
+                    queue.append((_risk_float(ts), aid))
+        for realm, saved in saved_waves.items():
+            if realm not in REALMS or not isinstance(saved, dict):
+                continue
+            until = _risk_float(saved.get("pausedUntil"))
+            if until <= now:
+                continue
+            _pool_risk_waves[realm]["pausedUntil"] = until
+            _pool_risk_waves[realm]["reason"] = str(saved.get("reason") or "restricted-wave")
+            _pool_risk_waves[realm]["lastRestrictedAt"] = _risk_float(saved.get("lastRestrictedAt"))
+
+
+def _pool_record_failure(a: dict, failure: dict, model: str = "") -> bool:
+    """记录失败；返回该账号是否应暂时移出账号轮转。"""
+    aid = account_id(a)
+    realm = realm_of(a)
+    h = _health(aid)
+    now = time.time()
+    kind = failure.get("kind") or "request_error"
+    changed_restriction = False
+    wave_triggered = False
+    remove_account = False
+    with _pool_lock:
+        h["lastError"] = str(failure.get("label") or kind)[:200]
+        h["lastErrorClass"] = kind
+        h["lastErrorCode"] = failure.get("code")
+        h["lastRequestId"] = str(failure.get("requestId") or "")[:200]
+        h["lastFailureAt"] = now
+        if kind == "restricted":
+            if not h.get("restricted"):
+                h["restricted"] = True
+                h["restrictedAt"] = now
+                h["restrictionCode"] = failure.get("code") or 11140
+                _pool_stats["restricted"] += 1
+                changed_restriction = True
+            events = _pool_risk_events.setdefault(realm, collections.deque(maxlen=256))
+            if changed_restriction:
+                events.append((now, aid))
+            cutoff = now - RISK_WINDOW
+            while events and events[0][0] < cutoff:
+                events.popleft()
+            wave = _pool_risk_waves.setdefault(
+                realm, {"pausedUntil": 0.0, "reason": "", "lastRestrictedAt": 0.0})
+            wave["lastRestrictedAt"] = now
+            if len({event_aid for _, event_aid in events}) >= RISK_THRESHOLD \
+                    and wave.get("pausedUntil", 0.0) <= now:
+                wave["pausedUntil"] = now + RISK_PAUSE
+                wave["reason"] = "restricted-wave"
+                _pool_stats["wavePauses"] += 1
+                wave_triggered = True
+            remove_account = True
+        elif kind == "model_limit":
+            if model:
+                h["modelCooldowns"][model] = max(
+                    float(h["modelCooldowns"].get(model) or 0.0),
+                    now + (failure.get("retryAfter") or POOL_MODEL_COOLDOWN))
+        elif kind == "queue":
+            pause = failure.get("channelPause") or POOL_QUEUE_COOLDOWN
+            entry = _pool_channel_pauses.setdefault(realm, {})
+            entry["pausedUntil"] = max(float(entry.get("pausedUntil") or 0.0), now + pause)
+            entry["reason"] = "queue"
+        elif kind == "session_limit":
+            # 不冻结账号。当前没有经过验证的会话清理接口，不能用猜测的
+            # DELETE 请求扩大风险；直接把 429 返回给调用方。
+            pass
+        elif failure.get("accountCooldown"):
+            if kind == "rate_limit":
+                h["softCount"] = min(h["softCount"] + 1, 30)
+                delay = min(float(failure["accountCooldown"]) * (2 ** (h["softCount"] - 1)), POOL_SOFT_MAX)
+            else:
+                delay = float(failure["accountCooldown"])
+            h["cooldownUntil"] = max(h["cooldownUntil"], now + delay)
+            remove_account = True
+        elif failure.get("breaker"):
+            h["fails"] += 1
+            if h["fails"] >= POOL_FAIL_THRESHOLD:
+                h["breakerUntil"] = now + POOL_BREAKER
+                h["fails"] = 0
+                remove_account = True
+    if changed_restriction or wave_triggered:
+        _save_risk_state()
+    if wave_triggered:
+        log("账号池：%s 在 %.0f 秒内出现 %d 个不同账号受限，暂停派发 %.0f 分钟" %
+            (REALMS[realm]["label"], RISK_WINDOW, RISK_THRESHOLD, RISK_PAUSE / 60))
+    if changed_restriction:
+        log("账号池：%s 被账号级风控限制，停止自动换号" % (account_name(a) or aid[:8]))
+    if remove_account and failure.get("breaker") and not failure.get("accountCooldown"):
+        log("账号池：%s 连续失败，熔断 %.0f 分钟" %
+            (account_name(a) or aid[:8], POOL_BREAKER / 60))
+    return remove_account
+
+
+def _pool_model_cooldown_remaining(a: dict, model: str, now: float | None = None) -> int:
+    now = time.time() if now is None else now
+    h = _health(account_id(a))
+    with _pool_lock:
+        cooldowns = h.get("modelCooldowns") or {}
+        until = float(cooldowns.get(model) or 0.0)
+        if until <= now:
+            cooldowns.pop(model, None)
+            return 0
+        return _seconds_left(until, now)
 
 
 def _pool_available(aid: str, now: float | None = None) -> bool:
     now = time.time() if now is None else now
     h = _health(aid)
     with _pool_lock:
-        return h["cooldownUntil"] <= now and h["breakerUntil"] <= now
+        # 与 pool_status 共用同一个状态判定，避免两处各写一套「可用」定义而漂移
+        return _pool_state(h, now) == "available"
 
 
 def _pool_pick(realm: str, session_key: str = "", exclude: set | None = None) -> dict | None:
-    """在指定池内挑一个可用账号。
-
-    优先级：会话粘性命中 > 当前账号（让单账号用户行为完全不变）> 池内其余可用账号。
-    """
+    """在指定池内挑一个可用账号；池已关闭或风控暂停时不派发。"""
+    if not POOL_ENABLED or _risk_pause_status(realm)["paused"]:
+        return None
     exclude = exclude or set()
     members = _pool_members(realm)
     if not members:
         return None
     by_id = {account_id(m): m for m in members}
     now = time.time()
-    # 1) 会话粘性
+
+    def usable(aid: str) -> bool:
+        return aid in by_id and aid not in exclude and _pool_available(aid, now)
+
     if session_key:
         with _pool_lock:
             hit = _pool_sticky.get(session_key)
             if hit and hit[1] <= now:
-                _pool_sticky.pop(session_key, None)   # 过期即清
+                _pool_sticky.pop(session_key, None)
                 hit = None
-        # 注意：_pool_available 自己也会取 _pool_lock，不要在上面的 with 里调用它
-        if hit and hit[1] > now:
-            aid = hit[0]
-            if aid in by_id and aid not in exclude and _pool_available(aid, now):
-                return by_id[aid]
-    # 2) 当前账号优先：只有一个账号的人不会感到任何变化
+        if hit and hit[1] > now and usable(hit[0]):
+            return by_id[hit[0]]
     cur = _auth
     if cur is not None and realm_of(cur) == realm:
         cid = account_id(cur)
-        if cid in by_id and cid not in exclude and _pool_available(cid, now):
+        if usable(cid):
             return by_id[cid]
-    # 3) 池内轮转：跳过冷却/熔断的账号
     for aid in by_id:
-        if aid in exclude:
-            continue
-        if _pool_available(aid, now):
+        if usable(aid):
             return by_id[aid]
     return None
 
@@ -1625,7 +2329,6 @@ def _pool_bind(session_key: str, aid: str) -> None:
     now = time.time()
     with _pool_lock:
         if len(_pool_sticky) >= POOL_STICKY_MAX:
-            # 简单淘汰：先清过期，仍然超限就丢掉最早到期的那批
             dead = [k for k, v in _pool_sticky.items() if v[1] <= now]
             for k in dead:
                 _pool_sticky.pop(k, None)
@@ -1636,7 +2339,6 @@ def _pool_bind(session_key: str, aid: str) -> None:
 
 
 def _pool_unbind(session_key: str, aid: str) -> None:
-    """粘性账号失效时解绑，下次请求才能改投他人。"""
     if not session_key:
         return
     with _pool_lock:
@@ -1651,51 +2353,25 @@ def _pool_mark_ok(a: dict) -> None:
         h["fails"] = 0
         h["softCount"] = 0
         h["lastError"] = ""
+        h["lastErrorClass"] = ""
+        h["lastErrorCode"] = None
+        h["lastRequestId"] = ""
 
 
-def _pool_penalize(a: dict, status: int, reason: str) -> bool:
-    """记录一次失败并决定该账号是否应被移出轮转。返回是否真的惩罚了。"""
-    aid = account_id(a)
-    h = _health(aid)
-    now = time.time()
-    with _pool_lock:
-        h["lastError"] = (reason or "")[:200]
-        if status == 429:
-            # 软冷却：指数退避，封顶 POOL_SOFT_MAX。
-            # softCount 必须夹紧：2**n 无上限时，反复命中 429 会把指数顶到
-            # float 溢出，直接把请求线程打挂（OverflowError）。
-            h["softCount"] = min(h["softCount"] + 1, 30)
-            delay = min(POOL_SOFT_COOLDOWN * (2 ** (h["softCount"] - 1)), POOL_SOFT_MAX)
-            h["cooldownUntil"] = max(h["cooldownUntil"], now + delay)
-            return True
-        if status in (401, 403):
-            # 检测是否是账号封禁（code=11140）
-            if "11140" in reason:
-                # 账号封禁：永久禁用，不再参与轮询（设置为 100 年后）
-                h["cooldownUntil"] = now + 86400 * 36500  # ~100年
-                log("账号池：%s 被标记为封禁/异常（code=11140），已永久禁用"
-                    % (account_name(a) or aid[:8]))
-            else:
-                # 授权类：立刻冷却，等令牌刷新或用户重新登录；不计入熔断
-                h["cooldownUntil"] = max(h["cooldownUntil"], now + POOL_SOFT_COOLDOWN)
-            return True
-        if status == 402:
-            # 余额/积分不足：硬冷却较久（默认 1 小时），别在它身上反复烧请求
-            h["cooldownUntil"] = max(h["cooldownUntil"],
-                                     now + (POOL_HARD_COOLDOWN or 3600))
-            return True
-        if status >= 500:
-            h["fails"] += 1
-            if h["fails"] >= POOL_FAIL_THRESHOLD:
-                h["breakerUntil"] = now + POOL_BREAKER
-                h["fails"] = 0
-                log("账号池：%s 连续失败，熔断 %.0f 分钟" % (account_name(a) or aid[:8], POOL_BREAKER / 60))
-            return True
-        return False
+def _pool_state(h: dict, now: float) -> str:
+    if h.get("restricted"):
+        return "restricted"
+    if h.get("breakerUntil", 0.0) > now:
+        return "breaker"
+    if h.get("cooldownUntil", 0.0) > now:
+        if h.get("lastErrorClass") == "auth_inconclusive":
+            return "inconclusive"
+        return "cooldown"
+    return "available"
 
 
 def pool_status() -> dict:
-    """控制台展示用：按两池汇总成员与健康状态。"""
+    """控制台展示用：按两池汇总成员、受限/冷却状态和风控暂停。"""
     now = time.time()
     out = {}
     for realm in REALMS:
@@ -1704,18 +2380,35 @@ def pool_status() -> dict:
             aid = account_id(m)
             h = _health(aid)
             with _pool_lock:
+                state = _pool_state(h, now)
+                models = {name: _seconds_left(until, now)
+                          for name, until in (h.get("modelCooldowns") or {}).items()
+                          if float(until) > now}
                 rows.append({
                     "accountId": aid,
                     "name": account_name(m) or aid[:8],
-                    "available": h["cooldownUntil"] <= now and h["breakerUntil"] <= now,
+                    "available": state == "available",
+                    "state": state,
                     "cooldownIn": max(0, int(h["cooldownUntil"] - now)),
                     "breakerIn": max(0, int(h["breakerUntil"] - now)),
+                    "restrictedAt": h.get("restrictedAt", 0.0),
+                    "restrictionCode": h.get("restrictionCode"),
                     "fails": h["fails"],
                     "lastError": h["lastError"],
+                    "lastErrorClass": h.get("lastErrorClass", ""),
+                    "lastErrorCode": h.get("lastErrorCode"),
+                    "lastRequestId": h.get("lastRequestId", ""),
+                    "modelCooldowns": models,
                     "active": bool(_auth and account_id(_auth) == aid),
                 })
-        out[realm] = {"count": len(rows), "available": sum(1 for r in rows if r["available"]),
-                      "members": rows}
+        risk = _risk_pause_status(realm)
+        out[realm] = {
+            "count": len(rows),
+            "available": sum(1 for row in rows if row["available"]),
+            "restricted": sum(1 for row in rows if row["state"] == "restricted"),
+            "risk": risk,
+            "members": rows,
+        }
     out["enabled"] = POOL_ENABLED
     with _pool_lock:
         out["stickyCount"] = len(_pool_sticky)
@@ -1724,11 +2417,6 @@ def pool_status() -> dict:
 
 
 def _pool_session_key(handler) -> str:
-    """从请求里提取稳定的会话标识，用于会话粘性。
-
-    优先显式头（客户端自己带）；其次 OpenAI 语义上的 user 字段是每个请求都变的，
-    不能用；最后退回连接级 cookie，保证同一个客户端连接组落在同一账号。
-    """
     for name in ("X-Session-Id", "X-Conversation-Id", "Session-Id", "X-Claude-Code-Session"):
         v = handler.headers.get(name)
         if v and v.strip():
@@ -1736,51 +2424,96 @@ def _pool_session_key(handler) -> str:
     return ""
 
 
-#: 这些状态码意味着"换一个账号可能就好了"；其余 4xx 是请求本身的问题，
-#: 换号只会把同一个错误在池里跑一遍，徒增上游请求与积分消耗。
-POOL_SWITCH_STATUS = frozenset((401, 402, 403, 429, 500, 502, 503, 504))
+def _pick_request_account(realm: str, session_key: str) -> dict | None:
+    """选出本次请求使用的账号：池内可用成员，否则退回仍然可用的当前账号。"""
+    a = _pool_pick(realm, session_key)
+    if a is not None:
+        return a
+    cur = _auth
+    if cur is not None and _pool_available(account_id(cur)):
+        return cur
+    return None
 
 
-def _pool_can_switch(a: dict, status: int, tried: set) -> bool:
-    """判断这次的失败是否值得换号。"""
+def _pool_can_switch(a: dict, failure: dict, tried: set) -> bool:
     if not POOL_ENABLED:
         return False
-    if status not in POOL_SWITCH_STATUS:
+    if not failure.get("switch") or failure.get("restricted"):
+        return False
+    if _risk_pause_status(realm_of(a))["paused"]:
         return False
     if len(tried) >= POOL_MAX_SWITCH:
         return False
     return bool(_pool_members(realm_of(a)))
 
 
-def _pool_switch(a: dict, status: int, reason: str, session_key: str,
-                 tried: set) -> dict | None:
+def _pool_switch(a: dict, failure: dict, session_key: str, tried: set) -> dict | None:
     """惩罚当前账号并在同池内改投一个可用账号；没有可用账号时返回 None。"""
     aid = account_id(a)
     tried.add(aid)
-    _pool_penalize(a, status, reason)
-    # 粘性账号刚失败：解绑，否则下一次请求还会被粘回这个坏账号
-    _pool_unbind(session_key, aid)
+    if not failure.get("restricted"):
+        _pool_unbind(session_key, aid)
     nxt = _pool_pick(realm_of(a), session_key, exclude=tried)
     if nxt is None:
         with _pool_lock:
             _pool_stats["exhausted"] += 1
-        log("账号池：%s 池内已无可用账号（本次请求失败于 HTTP %s）"
-            % (REALMS[realm_of(a)]["label"], status))
+        log("账号池：%s 池内已无可用账号（本次失败：%s）" %
+            (REALMS[realm_of(a)]["label"], failure.get("label") or failure.get("kind")))
         return None
     with _pool_lock:
         _pool_stats["switch"] += 1
-
-    # 账号切换延时：避免过快切换触发风控（随机化 ±20%）
-    if POOL_SWITCH_DELAY > 0:
-        import random
-        delay = POOL_SWITCH_DELAY * (0.8 + random.random() * 0.4)  # 0.8x ~ 1.2x
-        log("账号池：HTTP %s，%s → %s 换号重试（延时 %.1fs）"
-            % (status, account_name(a) or aid[:8], account_name(nxt) or account_id(nxt)[:8], delay))
+    delay = POOL_SWITCH_DELAY * (0.8 + random.random() * 0.4) if POOL_SWITCH_DELAY > 0 else 0.0
+    log("账号池：%s，%s → %s 换号重试%s" %
+        (failure.get("label") or "上游失败", account_name(a) or aid[:8],
+         account_name(nxt) or account_id(nxt)[:8],
+         "（延时 %.1fs）" % delay if delay > 0 else ""))
+    if delay > 0:
         time.sleep(delay)
-    else:
-        log("账号池：HTTP %s，%s → %s 换号重试"
-            % (status, account_name(a) or aid[:8], account_name(nxt) or account_id(nxt)[:8]))
     return nxt
+
+
+def _recheck_failure(state: str) -> dict:
+    """把复查得到的 refresh 结论翻译成账号池可记录的失败分类。"""
+    restricted = state == REFRESH_RESTRICTED
+    return classify_upstream_failure(
+        403 if restricted else 401,
+        code=11140 if restricted else 401,
+        message="账号存在异常行为，已被限制使用" if restricted else "refresh rejected",
+        auth_state=state)
+
+
+def recheck_account_risk(aid: str) -> dict:
+    """手动只读复查：refresh 成功才解除本地限制；不发送对话请求。"""
+    a = _pool_member(aid)
+    if a is None:
+        raise ValueError("账号不存在或登录令牌为空")
+    h = _health(aid)
+    if not h.get("restricted"):
+        return {"ok": True, "cleared": False, "accountId": aid,
+                "message": "该账号当前没有本地受限标记"}
+    now = time.time()
+    with _pool_lock:
+        last = float(h.get("lastRecheckAt") or 0.0)
+        wait = _seconds_left(last + RECHECK_COOLDOWN, now, minimum=1)
+        if now - last < RECHECK_COOLDOWN:
+            return {"ok": False, "cleared": False, "accountId": aid,
+                    "message": "复查过于频繁，请等待 %d 秒后再试" % wait}
+        h["lastRecheckAt"] = now
+    state = refresh_auth_state(a)
+    if state != REFRESH_ALIVE:
+        if state in (REFRESH_RESTRICTED, REFRESH_DEAD):
+            _pool_record_failure(a, _recheck_failure(state))
+        return {"ok": False, "cleared": False, "accountId": aid,
+                "message": "只读探活未通过，账号仍保持受限；请先完成官方申诉"}
+    with _pool_lock:
+        # 整条健康记录归零：受限标记之外的 softCount / fails 也必须清掉，
+        # 否则解除限制后的第一个 429 会从旧的退避计数继续指数增长。
+        h.clear()
+        h.update(_health_defaults())
+        h["lastRecheckAt"] = now
+    _save_risk_state()
+    return {"ok": True, "cleared": True, "accountId": aid,
+            "message": "只读探活通过，已解除本地受限标记；下一次对话仍可能再次被限制"}
 
 
 def _refresher_loop() -> None:
@@ -2193,9 +2926,7 @@ def normalize_chat_body(obj: dict, account: dict | None = None) -> dict:
         first_role = str(first.get("role") or "").lower()
         if first_role != "system":
             msgs.insert(0, {"role": "system", "content": DEFAULT_SYSTEM})
-
-    # 5) 风控：处理 system 消息以避免触发内容审核（2026-10）
-    if isinstance(msgs, list) and msgs:
+        # 可选的 system 兼容改写；默认全部关闭
         _apply_system_message_workarounds(msgs)
 
     if isinstance(msgs, list):
@@ -2216,12 +2947,8 @@ def normalize_chat_body(obj: dict, account: dict | None = None) -> dict:
 
 def _apply_system_message_workarounds(msgs: list) -> None:
     """
-    应用 system 消息的风控绕过策略（2026-10 腾讯加强了内容审核）
-
-    策略：
-    1. WB_REMOVE_SYSTEM=1：完全移除 system 消息（激进，可能影响对话质量）
-    2. WB_LIMIT_SYSTEM_LENGTH=1：限制 system 消息长度
-    3. WB_SYSTEM_TO_USER=1：将过长的 system 转为首条 user 消息
+    应用可选的 system 兼容改写。默认不启用；这些选项会改变消息语义，
+    只应在确认目标上游需要时显式开启。
     """
     if not msgs:
         return
@@ -2363,11 +3090,12 @@ def anthropic_to_chat(body: dict) -> dict:
                 continue
             typ = block.get("type")
             if typ == "tool_use":
-                call = {"id": block.get("id") or "call_" + uuid.uuid4().hex[:16],
-                        "type": "function",
-                        "function": {"name": block.get("name") or "",
-                                       "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False)}}
-                calls.append(call)
+                calls.append({
+                    "id": block.get("id") or "call_" + uuid.uuid4().hex[:16],
+                    "type": "function",
+                    "function": {"name": block.get("name") or "",
+                                 "arguments": json.dumps(block.get("input") or {},
+                                                         ensure_ascii=False)}})
             elif typ == "tool_result":
                 results.append({"role": "tool", "tool_call_id": block.get("tool_use_id") or "",
                                 "content": _anthropic_content(block.get("content", ""))})
@@ -2382,10 +3110,11 @@ def anthropic_to_chat(body: dict) -> dict:
     out = {"model": body.get("model"), "messages": messages, "stream": True}
     if isinstance(body.get("max_tokens"), int) and body["max_tokens"] > 0:
         out["max_tokens"] = body["max_tokens"]
-    for src, dst in (("temperature", "temperature"), ("top_p", "top_p"),
-                     ("top_k", "top_k"), ("stop_sequences", "stop")):
-        if src in body:
-            out[dst] = body[src]
+    for key in ("temperature", "top_p", "top_k"):
+        if key in body:
+            out[key] = body[key]
+    if "stop_sequences" in body:
+        out["stop"] = body["stop_sequences"]
     metadata = body.get("metadata")
     if isinstance(metadata, dict) and isinstance(metadata.get("user_id"), str):
         out["user"] = metadata["user_id"]
@@ -2542,7 +3271,7 @@ def anthropic_stream(resp, model: str, acc: ChatAccumulator, ping=None):
 # ===========================================================================
 # 六、上游调用：长连接池 + 首字节前重试
 # ===========================================================================
-@__import__("functools").lru_cache(maxsize=64)
+@functools.lru_cache(maxsize=64)
 def _proxy_for(scheme: str, host: str) -> str:
     """与 urllib 相同的代理判定（HTTP(S)_PROXY / NO_PROXY / Windows 系统代理），按主机缓存。"""
     try:
@@ -2854,11 +3583,15 @@ def http_json(method: str, url: str, headers: dict, body: bytes | None = None, t
 
 
 class UpstreamError(Exception):
-    def __init__(self, status: int, msg: str, retry_after: str = ""):
+    def __init__(self, status: int, msg: str, retry_after: str = "",
+                 code=None, request_id: str = "", auth_state: str = ""):
         super().__init__(msg)
         self.status = status
         self.msg = msg
         self.retry_after = retry_after
+        self.code = code
+        self.request_id = request_id
+        self.auth_state = auth_state
 
 
 def _looks_like_gzip_rejection(status: int, body: bytes) -> bool:
@@ -3052,6 +3785,23 @@ def _error_log_metadata(obj: object) -> dict:
     return found
 
 
+def _meta_request_id(meta: dict) -> str:
+    if not isinstance(meta, dict):
+        return ""
+    return str(meta.get("request_id") or meta.get("requestid")
+               or meta.get("trace_id") or meta.get("traceid")
+               or meta.get("response_id") or "")
+
+
+# 上游可能用 HTTP 200 + 业务码返回错误；这些业务码决定下游看到的 HTTP 状态。
+_CODE_STATUS = {11140: 403, 11128: 400, 6000: 429, 6020: 429, 6021: 429, 10105: 429}
+
+
+def _sse_error_http_status(code) -> int:
+    """SSE 错误帧只有业务码：按码映射状态码，未知码统一按上游故障处理。"""
+    return _CODE_STATUS.get(to_int(code), 502)
+
+
 def _safe_error_summary(status: int, obj: object = None, code: object = None) -> str:
     """构造只含结构化元数据的错误摘要，供日志与用量文件使用。
 
@@ -3059,8 +3809,8 @@ def _safe_error_summary(status: int, obj: object = None, code: object = None) ->
     客户端仍会收到经过脱敏的可读错误信息，但持久化只保留状态码与错误码。
     """
     parts = ["HTTP %s" % (to_int(status) or 502)]
-    if code is None and isinstance(obj, dict):
-        meta = _error_log_metadata(obj)
+    meta = _error_log_metadata(obj) if isinstance(obj, dict) else {}
+    if code is None:
         code = meta.get("code", meta.get("error_code", meta.get("status_code")))
     if isinstance(code, bool):
         code = None
@@ -3070,8 +3820,7 @@ def _safe_error_summary(status: int, obj: object = None, code: object = None) ->
         code = None
     if code is not None:
         parts.append("code=%s" % code)
-    meta = _error_log_metadata(obj) if isinstance(obj, dict) else {}
-    rid = meta.get("request_id") or meta.get("trace_id") or meta.get("response_id")
+    rid = _meta_request_id(meta)
     if rid:
         parts.append("request_id=%s" % rid)
     return "上游错误（%s）" % "，".join(parts)
@@ -3083,21 +3832,31 @@ def _safe_stream_error(exc: BaseException) -> str:
     return "上游响应流中断（HTTP %s）" % to_int(status)
 
 
+def _buffer_response_with_meta(resp):
+    """读取错误体并缓存，供路径重试与 read_error 共用同一次响应。"""
+    raw = resp.read()
+    text = raw.decode("utf-8", "replace")
+    buffered = _BufferedResponse(resp, raw)
+    buffered.wb2api_error_meta = _parse_error_metadata(text)
+    return buffered, text[:4096]
+
+
 _chat_path = CHAT_PATH
 _chat_paths: dict[str, str] = {}  # 按上游域名记住路径，国内外请求互不干扰
 
 
 def call_upstream(payload: dict, a: dict) -> UpstreamResponse:
-    """调用上游；只重试可确认安全的连接建立失败与 429。"""
+    """调用上游；只重试可确认安全的连接失败、普通 429，以及一次 11128 路径回退。"""
     base = upstream_base(a)
     chat_path = _chat_paths.get(base, CHAT_PATH)
-    # ensure_ascii=True：代码/英文为主的上下文序列化快 3~4 倍；体积膨胀的部分 gzip 会吃掉
     request_id = payload.get("_wb2api_request_id") or _uuid7().hex
     upstream_payload = {key: value for key, value in payload.items()
                         if key != "_wb2api_request_id"}
     data = json.dumps(upstream_payload, separators=(",", ":")).encode("ascii")
     gz = _gzip(data) if _gzip_ok and not _gzip_disabled(base) and len(data) >= GZIP_MIN else None
-    refreshed = tried_alt = False
+    refreshed = False
+    tried_alt = False
+    tried_channel_alt = False
     attempt = 0
     while True:
         token = a.get("accessToken")
@@ -3108,22 +3867,19 @@ def call_upstream(payload: dict, a: dict) -> UpstreamResponse:
         h["X-Conversation-Request-ID"] = request_id
         h["X-Root-Request-ID"] = request_id
         body = data
-        if gz is not None and _gzip_ok and not _gzip_disabled(base):
+        if gz is not None and not _gzip_disabled(base):
             h["Content-Encoding"] = "gzip"
             body = gz
             with _gzip_stats_lock:
                 _gzip_stats["requests"] += 1
                 _gzip_stats["saved_bytes"] += len(data) - len(gz)
         if DEBUG:
-            # 只记录元数据：payload 里的 messages/system 是用户对话正文，绝不能进日志。
-            # _safe_log_payload 负责剔除这些字段，这里只补充体积、条数等排查信息。
             meta = _safe_log_payload(payload)
             msgs = payload.get("messages") or []
-            first_msg = msgs[0] if msgs and isinstance(msgs, list) and msgs[0] and isinstance(msgs[0], dict) else {}
+            first_msg = msgs[0] if isinstance(msgs, list) and msgs and isinstance(msgs[0], dict) else {}
             log("→ POST %s model=%s messages=%d (首条role=%s) fields=%d %dB%s" % (
                 url, meta.get("model"), len(msgs), first_msg.get("role", "N/A"), len(meta),
                 len(body), "（gzip，原 %dB）" % len(data) if body is gz else ""))
-            # 只输出安全白名单内的请求头，凭证与设备标识默认不落日志。
             safe_headers = _safe_log_headers(h)
             log("  请求头：%s" % json.dumps(safe_headers, ensure_ascii=False))
         try:
@@ -3144,24 +3900,54 @@ def call_upstream(payload: dict, a: dict) -> UpstreamResponse:
                 resp.close()
                 with _gzip_stats_lock:
                     if GZIP_DISABLE_TTL == 0:
-                        _gzip_disabled_bases[base] = 0  # 永久禁用
+                        _gzip_disabled_bases[base] = 0
                     else:
                         _gzip_disabled_bases[base] = time.time() + GZIP_DISABLE_TTL
                 log("上游 %s 拒绝 gzip 请求体，已按该上游禁用压缩 %s" % (
                     st, "永久" if GZIP_DISABLE_TTL == 0 else f"{GZIP_DISABLE_TTL}秒"))
                 continue
             resp = _BufferedResponse(resp, raw)
+
+        if st in (400, 403, 429):
+            content_type = str(resp.headers.get("Content-Type") or "").lower()
+            if "event-stream" not in content_type:
+                resp, error_text = _buffer_response_with_meta(resp)
+                meta = resp.wb2api_error_meta
+                failure = classify_upstream_failure(
+                    st, code=meta.get("code"), message=error_text,
+                    request_id=request_id)
+                if (st == 400 and failure.get("kind") == "channel_check"
+                        and not tried_channel_alt and chat_path == CHAT_PATH):
+                    tried_channel_alt = True
+                    _discard(resp)
+                    chat_path = CHAT_PATH_ALT
+                    rid = _meta_request_id(meta)
+                    log("上游 11128 渠道校验失败，切换到备用接口路径重试一次%s" %
+                        ("（request_id=%s）" % rid if rid else ""))
+                    continue
+                if st == 429 and failure.get("kind") in ("model_limit", "queue", "session_limit"):
+                    return resp
+
         if st == 401 and not refreshed:
             refreshed = True
             _discard(resp)
-            if refresh_auth(a, stale_token=token):
+            state = refresh_auth_state(a, stale_token=token)
+            if state == REFRESH_ALIVE:
                 continue
-            raise UpstreamError(401, "上游登录已过期且刷新失败，请重新登录")
+            if state == REFRESH_RESTRICTED:
+                raise UpstreamError(403, "上游账号已被限制使用，系统已停止自动换号",
+                                    code=11140, request_id=request_id,
+                                    auth_state=state)
+            if state == REFRESH_INCONCLUSIVE:
+                raise UpstreamError(503, "上游授权状态暂时无法确认，已短冷却且不换号",
+                                    code=401, request_id=request_id,
+                                    auth_state=state)
+            raise UpstreamError(401, "上游登录已过期且刷新失败，请重新登录",
+                                code=401, request_id=request_id, auth_state=state)
         if st in (404, 405) and not tried_alt:
             tried_alt = True
             _discard(resp)
             chat_path = CHAT_PATH_ALT if chat_path == CHAT_PATH else CHAT_PATH
-            _chat_paths[base] = chat_path
             log("对话接口路径回退 → %s" % chat_path)
             continue
         if st == 429 and attempt < UPSTREAM_RETRIES:
@@ -3172,6 +3958,8 @@ def call_upstream(payload: dict, a: dict) -> UpstreamResponse:
                 log("上游 %s，%.1fs 后第 %d 次重试" % (st, delay, attempt))
                 time.sleep(delay)
                 continue
+        if st < 400:
+            _chat_paths[base] = chat_path
         return resp
 
 
@@ -3187,12 +3975,25 @@ def _gzip(data: bytes) -> bytes:
 
 def is_sse(resp) -> bool:
     """上游偶尔用 HTTP 200 返回 JSON 业务错误，而不是 SSE。"""
-    ct = ""
     try:
-        ct = resp.headers.get("Content-Type") or ""
+        ct = (resp.headers.get("Content-Type") or "").lower()
     except Exception:  # noqa: BLE001
-        pass
-    return not ct or "event-stream" in ct.lower()
+        ct = ""
+    return not ct or "event-stream" in ct
+
+
+# 日志脱敏规则：凭证、本地密钥与用户输入回显都必须先抹掉再落日志。
+_LOG_REDACTIONS = tuple((re.compile(pattern, re.IGNORECASE | re.DOTALL), replacement)
+                        for pattern, replacement in (
+    (r'["\']?accessToken["\']?\s*:\s*["\'][^"\']+["\']', '"accessToken":"[REDACTED]"'),
+    (r'["\']?deviceToken["\']?\s*:\s*["\'][^"\']+["\']', '"deviceToken":"[REDACTED]"'),
+    (r'["\']?refreshToken["\']?\s*:\s*["\'][^"\']+["\']', '"refreshToken":"[REDACTED]"'),
+    (r'sk-[a-f0-9]{32}', 'sk-[REDACTED]'),
+    (r'Bearer\s+[A-Za-z0-9\-._~+/]+=*', 'Bearer [REDACTED]'),
+    # 用户输入回显（messages 数组内容）
+    (r'"messages"\s*:\s*\[[^\]]{100,}\]', '"messages":[REDACTED]'),
+    (r'"content"\s*:\s*"[^"]{80,}"', '"content":"[TRUNCATED]"'),
+))
 
 
 def _sanitize_for_log(text: str, max_len: int = 200) -> str:
@@ -3204,20 +4005,8 @@ def _sanitize_for_log(text: str, max_len: int = 200) -> str:
     text = text.replace('\r', ' ').replace('\n', ' ').replace('\t', ' ')
 
     # 2. 脱敏敏感字段模式
-    import re
-    patterns = [
-        # 凭证类
-        (r'["\']?accessToken["\']?\s*:\s*["\'][^"\']+["\']', '"accessToken":"[REDACTED]"'),
-        (r'["\']?deviceToken["\']?\s*:\s*["\'][^"\']+["\']', '"deviceToken":"[REDACTED]"'),
-        (r'["\']?refreshToken["\']?\s*:\s*["\'][^"\']+["\']', '"refreshToken":"[REDACTED]"'),
-        (r'sk-[a-f0-9]{32}', 'sk-[REDACTED]'),
-        (r'Bearer\s+[A-Za-z0-9\-._~+/]+=*', 'Bearer [REDACTED]'),
-        # 用户输入回显（messages 数组内容）
-        (r'"messages"\s*:\s*\[[^\]]{100,}\]', '"messages":[REDACTED]'),
-        (r'"content"\s*:\s*"[^"]{80,}"', '"content":"[TRUNCATED]"'),
-    ]
-    for pattern, replacement in patterns:
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE | re.DOTALL)
+    for pattern, replacement in _LOG_REDACTIONS:
+        text = pattern.sub(replacement, text)
 
     # 3. 长度限制
     if len(text) > max_len:
@@ -3241,12 +4030,16 @@ def sse_error(obj) -> str | None:
     return None
 
 
-def read_error(resp) -> tuple[int, str, int | None]:
-    """读取上游错误响应，返回 (状态码, 清洗后的错误摘要, 安全错误码)。
+def _parse_error_metadata(raw: str) -> dict:
+    try:
+        obj = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return _error_log_metadata(obj) if isinstance(obj, dict) else {}
 
-    错误摘要用于返回客户端和记录日志，已脱敏敏感信息并限制长度。
-    第三个返回值只含数字错误码，供账号池判断 code=11140 等结构性条件。
-    """
+
+def read_error(resp) -> tuple[int, str, int | None]:
+    """读取上游错误响应，返回 (状态码, 清洗后的错误摘要, 安全错误码)。"""
     status = getattr(resp, "status", 502) or 502
     try:
         raw = resp.read().decode("utf-8", "replace")
@@ -3258,53 +4051,42 @@ def read_error(resp) -> tuple[int, str, int | None]:
         except Exception:  # noqa: BLE001
             pass
 
-    # 调试模式只记录脱敏后的摘要；上游错误可能回显用户提示词或凭证。
+    # 复用上游缓冲时已经算过的元数据，避免对同一份正文再解析一次 JSON
+    meta = getattr(resp, "wb2api_error_meta", None) or _parse_error_metadata(raw)
+    resp.wb2api_error_meta = meta
     if DEBUG and raw:
-        try:
-            err_obj = json.loads(raw)
-            metadata = _error_log_metadata(err_obj)
-            summary = json.dumps(metadata, ensure_ascii=False, separators=(",", ":")) \
-                if metadata else ""
-        except Exception:  # noqa: BLE001 - 非 JSON 错误体也绝不记录原文
-            summary = ""
+        summary = json.dumps(meta, ensure_ascii=False, separators=(",", ":")) if meta else ""
         if summary:
-            log("  上游错误响应元数据（HTTP %s）：%s"
-                % (status, _sanitize_for_log(summary, max_len=500)))
+            log("  上游错误响应元数据（HTTP %s）：%s" %
+                (status, _sanitize_for_log(summary, max_len=500)))
         else:
             log("  上游错误响应：无可记录元数据（HTTP %s，%d 字节）" % (status, len(raw)))
 
-    err_obj = None
     err_code = None
     try:
         obj = json.loads(raw)
-        err_obj = obj
         msg = sse_error(obj) or obj.get("msg") or obj.get("message") or raw
-        # 与调试日志共用同一个结构化元数据解析器，避免两套提取逻辑再次分叉。
-        meta = _error_log_metadata(obj)
-        err_code = meta.get("code")
-        if err_code is None:
-            err_code = meta.get("error_code")
-        if err_code is None:
-            err_code = meta.get("status_code")
-        code = err_code
-        if code is not None and "code=" not in str(msg):
-            msg = "%s (code=%s)" % (msg, code)
+        err_code = (meta.get("code") or meta.get("error_code")
+                    or meta.get("status_code"))
+        if err_code is not None and "code=" not in str(msg):
+            msg = "%s (code=%s)" % (msg, err_code)
     except Exception:  # noqa: BLE001
         msg = raw or "上游返回错误"
 
-    # 清洗错误信息（脱敏 + 长度限制）
     msg = _sanitize_for_log(str(msg), max_len=300)
-
-    if status < 400:      # 200 + JSON 业务错误
+    code_i = to_int(err_code)
+    if code_i == 11140 or (status == 403 and "11140" in msg):
+        status = 403
+        msg = "%s —— 该账号已被限制使用，系统已停止自动换号；申诉后可手动复查" % msg
+    elif code_i == 11128 or (status == 400 and ("11128" in msg or "unapproved channel" in msg.lower())):
+        status = 400
+        msg = "%s —— 请求未通过渠道校验，系统不会因此惩罚账号或继续换号" % msg
+    elif code_i in (401, 402, 403):
+        status = code_i
+    elif code_i in _CODE_STATUS:      # 6000/6020/6021/10105：HTTP 200 的业务码也是限流
+        status = _CODE_STATUS[code_i]
+    elif status < 400:
         status = 502
-    if status == 403 and "11140" in str(msg):
-        # code=11140 实际上是账号封禁/异常，不是版本问题
-        if "异常" in str(msg) or "封禁" in str(msg) or "限制" in str(msg):
-            msg = "%s —— 该账号已被限制使用，如需申诉请联系官方" % msg
-        else:
-            msg = "%s —— 可能是账号异常或需要更新客户端版本" % msg
-    # 返回值同时用于客户端提示和持久化：客户端需要可读原因，日志/用量只允许
-    # 结构化摘要。调用方通过 _safe_error_summary 生成后者。
     return status, "上游拒绝请求：%s" % msg, err_code
 
 
@@ -3506,7 +4288,11 @@ def aggregate_sse(resp, acc: ChatAccumulator | None = None) -> dict:
     for chunk in iter_chunks(resp):
         err = sse_error(chunk)
         if err:
-            raise UpstreamError(502, "上游返回错误：%s" % err)
+            meta = _error_log_metadata(chunk)
+            code = meta.get("code")
+            status = _sse_error_http_status(code)
+            raise UpstreamError(status, _safe_error_summary(status, chunk), code=code,
+                                request_id=_meta_request_id(meta))
         acc.feed(chunk)
     return acc.completion()
 
@@ -4231,43 +5017,19 @@ def is_global(a: dict | None = None) -> bool:
 def desktop_ua(a: dict | None = None) -> str:
     """官方桌面端 UA。
 
-    国际版按 5.8.4 抓包：`WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`
-    （末段 CLI 版本是客户端内置 CLI 的版本，不是桌面端自身版本）；
-    国内版维持既有身份——没有对应抓包，改动风险大于收益。
-
-    添加了更真实的指纹特征以降低被检测风险。
+    版本必须与同一次请求的 `X-IDE-Version` 完全一致。官方客户端不会在
+    同一会话中随机改变次版本号；UA 与 X-IDE-Version 不一致反而会形成
+    明显的代理特征，因此这里只使用一个确定性的真实版本。
     """
     if is_global(a):
-        # 国际版：使用最新版本，模拟官方客户端
         client_ver = get_intl_client_version()
         cli_ver = get_intl_cli_version()
-
-        # 随机化次版本号的最后一位，模拟不同的客户端更新状态
-        if _FINGERPRINT_ENABLED:
-            import random
-            # 保持主版本一致，只微调最后的修订号（例如 5.8.4 → 5.8.3-5.8.5）
-            parts = client_ver.split('.')
-            if len(parts) == 3:
-                patch = int(parts[2])
-                # 在 ±1 范围内随机抖动
-                jittered_patch = max(0, patch + random.randint(-1, 1))
-                client_ver = f"{parts[0]}.{parts[1]}.{jittered_patch}"
-
-        return "WorkBuddy/%s workbuddy-ai/%s CLI/%s" % (client_ver, client_ver, cli_ver)
-
-    # 国内版：同样策略
-    client_ver = get_client_version()
-    cli_ver = get_cli_version()
-
-    if _FINGERPRINT_ENABLED:
-        import random
-        parts = client_ver.split('.')
-        if len(parts) == 3:
-            patch = int(parts[2])
-            jittered_patch = max(0, patch + random.randint(-1, 1))
-            client_ver = f"{parts[0]}.{parts[1]}.{jittered_patch}"
-
-    return "WorkBuddy/%s WorkBuddy/%s CLI/%s" % (client_ver, client_ver, cli_ver)
+        product = "workbuddy-ai"
+    else:
+        client_ver = get_client_version()
+        cli_ver = get_cli_version()
+        product = "WorkBuddy"
+    return "WorkBuddy/%s %s/%s CLI/%s" % (client_ver, product, client_ver, cli_ver)
 
 
 def models_headers(a: dict, ua: str) -> dict:
@@ -4743,6 +5505,26 @@ def resolve_model(name: str, a: dict) -> tuple[str, str | None]:
 #    "default_model": "deepseek-v4.1-flash", "enforce": false}
 # 文件改动会自动热加载，不用重启。
 # ---------------------------------------------------------------------------
+def _clean_model_ids(values) -> list[str]:
+    """去空白、去空项、去重；调用方负责先确认 values 是字符串数组。"""
+    return list(dict.fromkeys(v.strip() for v in values if v.strip()))
+
+
+def _clean_aliases(mapping) -> dict[str, str]:
+    """别名表规范化：键值都必须是字符串，空白项丢弃。"""
+    return {k.strip(): v.strip() for k, v in mapping.items()
+            if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()}
+
+
+def _is_model_id_list(value) -> bool:
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def _is_str_map(value) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items())
+
+
 def load_selection() -> None:
     """仅在完整读取有效配置后更新内存，编辑中的无效文件不会解除模型限制。"""
     global _selection, _aliases, _default_model, _enforce, _selection_mtime
@@ -4756,13 +5538,13 @@ def load_selection() -> None:
             if not isinstance(raw, (dict, list)):
                 raise ValueError("配置必须是对象或模型数组")
             ids = raw.get("models", []) if isinstance(raw, dict) else raw
-            if not isinstance(ids, list) or any(not isinstance(i, str) for i in ids):
+            if not _is_model_id_list(ids):
                 raise ValueError("models 必须是字符串数组")
             raw = raw if isinstance(raw, dict) else {}
             al = raw.get("aliases", {})
             dm = raw.get("default_model", "")
             enforce = raw.get("enforce", False)
-            if not isinstance(al, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in al.items()):
+            if not _is_str_map(al):
                 raise ValueError("aliases 必须是模型名称之间的映射")
             if not isinstance(dm, str) or not isinstance(enforce, bool):
                 raise ValueError("默认模型或强制筛选开关的类型不正确")
@@ -4777,36 +5559,32 @@ def load_selection() -> None:
                 if not isinstance(realm, str) or not isinstance(config, dict):
                     raise ValueError(f"池 {realm} 配置格式不正确")
                 pool_models = config.get("models", [])
-                if not isinstance(pool_models, list) or any(not isinstance(i, str) for i in pool_models):
+                if not _is_model_id_list(pool_models):
                     raise ValueError(f"池 {realm} 的 models 必须是字符串数组")
                 pool_aliases_val = config.get("aliases", {})
-                if not isinstance(pool_aliases_val, dict) or any(
-                        not isinstance(k, str) or not isinstance(v, str)
-                        for k, v in pool_aliases_val.items()):
+                if not _is_str_map(pool_aliases_val):
                     raise ValueError(f"池 {realm} 的 aliases 必须是模型名称映射")
-                pool_selections[realm] = list(dict.fromkeys(i.strip() for i in pool_models if i.strip()))
-                pool_aliases_map[realm] = {k.strip(): v.strip()
-                                          for k, v in pool_aliases_val.items()
-                                          if k.strip() and v.strip()}
+                pool_selections[realm] = _clean_model_ids(pool_models)
+                pool_aliases_map[realm] = _clean_aliases(pool_aliases_val)
 
             profiles = raw.get("accounts", {})
             owner = raw.get("activeAccountId", "")
             use_own_models = raw.get("accountUseOwnModels", {})
             if not isinstance(owner, str) or not isinstance(profiles, dict) or any(
-                    not isinstance(key, str) or not key or not isinstance(value, list) or
-                    any(not isinstance(i, str) for i in value) for key, value in profiles.items()):
+                    not isinstance(key, str) or not key or not _is_model_id_list(value)
+                    for key, value in profiles.items()):
                 raise ValueError("账号模型勾选配置格式不正确")
             if not isinstance(use_own_models, dict) or any(
-                    not isinstance(k, str) or not k or not isinstance(v, bool) for k, v in use_own_models.items()):
-                raise ValueError("账户级模型开关配置格式不正确")
+                    not isinstance(k, str) or not k or not isinstance(v, bool)
+                    for k, v in use_own_models.items()):
+                raise ValueError("账户级模型开关格式不正确")
         except FileNotFoundError:
             return
         except (OSError, ValueError) as e:
             _warn_once("模型配置读取失败，保留原配置：%s" % e)
             return
-        selected = list(dict.fromkeys(i.strip() for i in ids if i.strip()))
-        profiles = {key: list(dict.fromkeys(i.strip() for i in value if i.strip()))
-                    for key, value in profiles.items()}
+        selected = _clean_model_ids(ids)
+        profiles = {key: _clean_model_ids(value) for key, value in profiles.items()}
         active = account_id(_auth) if _auth else ""
         scoped = "accounts" in raw
 
@@ -4836,7 +5614,7 @@ def load_selection() -> None:
         if _auth and pools:
             realm = _pool_realm(_auth)
             merged_aliases = dict(pool_aliases_map.get(realm, {}))
-        merged_aliases.update({k.strip(): v.strip() for k, v in al.items() if k.strip() and v.strip()})
+        merged_aliases.update(_clean_aliases(al))
 
         _aliases = merged_aliases
         _default_model, _enforce, _selection_mtime = dm.strip(), enforce, mt
@@ -4864,7 +5642,7 @@ def resolve_api_key(explicit: str = "", ephemeral: bool = False) -> tuple[str, s
     优先级：--api-key / WB_API_KEY > 密钥文件 > 新生成。
     默认把新生成的密钥写进密钥文件，重启后不变，客户端不用跟着改配置；
     ephemeral=True 时每次启动都用一次性随机密钥，不读也不写文件。
-    
+
     返回的第三个值标记密钥是否已持久化：
     - True: 来自文件或刚生成并落盘，重启后自动可用
     - False: 仅存在于命令行/环境变量，重启后会丢失
@@ -4895,15 +5673,24 @@ def _mask_api_key(key: str) -> str:
     return "***"
 
 
-def _pools_payload() -> dict:
-    """把内存里的池级模型与别名组装成 selection.json 的 pools 字段。"""
+def _pools_payload(pool_models: dict | None = None,
+                   pool_aliases: dict | None = None) -> dict:
+    """把池级模型与别名组装成 selection.json 的 pools 字段。
+
+    不传参数时取内存里的当前值；save_selection 传入待写入的副本，
+    避免在持锁路径上再次读取全局状态。
+    """
+    if pool_models is None:
+        pool_models = _pool_selections
+    if pool_aliases is None:
+        pool_aliases = _pool_aliases
     out = {}
-    for realm in set(_pool_selections) | set(_pool_aliases):
+    for realm in set(pool_models) | set(pool_aliases):
         entry = {}
-        if realm in _pool_selections:
-            entry["models"] = list(_pool_selections[realm])
-        if realm in _pool_aliases:
-            entry["aliases"] = dict(_pool_aliases[realm])
+        if realm in pool_models:
+            entry["models"] = list(pool_models[realm])
+        if realm in pool_aliases:
+            entry["aliases"] = dict(pool_aliases[realm])
         out[realm] = entry
     return out
 
@@ -4930,7 +5717,7 @@ def selection_for_account(a: dict) -> list[str]:
 
 def save_selection(ids: list | None = None, **extra) -> dict:
     """串行保存配置；落盘成功后才更新内存，部分更新不会覆盖并发修改。"""
-    global _selection, _aliases, _default_model, _enforce, _selection_mtime
+    global _selection, _aliases, _default_model, _enforce
     global _account_selections, _selection_owner, _selection_scoped
     global _pool_selections, _pool_aliases, _account_use_own_models
     with _lock, _selection_lock:
@@ -4969,16 +5756,8 @@ def save_selection(ids: list | None = None, **extra) -> dict:
 
         payload = {"models": selected, "aliases": aliases, "default_model": default, "enforce": enforce}
 
-        # 添加池配置到 payload
-        if pool_models or pool_alias:
-            pools_payload = {}
-            all_realms = set(pool_models.keys()) | set(pool_alias.keys())
-            for realm in all_realms:
-                pools_payload[realm] = {}
-                if realm in pool_models:
-                    pools_payload[realm]["models"] = pool_models[realm]
-                if realm in pool_alias:
-                    pools_payload[realm]["aliases"] = pool_alias[realm]
+        pools_payload = _pools_payload(pool_models, pool_alias)
+        if pools_payload:
             payload["pools"] = pools_payload
 
         profiles = {key: list(value) for key, value in _account_selections.items()}
@@ -4987,12 +5766,11 @@ def save_selection(ids: list | None = None, **extra) -> dict:
         if aid and ids is not None:
             profiles[aid] = list(selected)
         payload.update(accounts=profiles, activeAccountId=aid, accountUseOwnModels=use_own_models)
-        _write_private(SELECTION_FILE, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        _write_selection_file(payload)
         _selection, _aliases, _default_model, _enforce = selected, aliases, default, enforce
         _account_selections, _selection_owner, _selection_scoped = profiles, aid, True
         _pool_selections, _pool_aliases = pool_models, pool_alias
         _account_use_own_models = use_own_models
-        _selection_mtime = os.path.getmtime(SELECTION_FILE)
         # 返回真正生效的集合（可能是池级），否则切换开关后前端会显示一份不再生效的清单
         effective = selection_for_account(_auth) if _auth else list(selected)
         return {"ok": True, "accountId": aid, "selected": effective, "aliases": dict(aliases),
@@ -5254,6 +6032,12 @@ _ERR_TYPES = {400: "invalid_request_error", 401: "authentication_error",
               503: "service_unavailable"}
 _ERR_CODES = {401: "invalid_api_key", 404: "model_not_found", 413: "request_too_large",
               429: "rate_limit_exceeded"}
+# Anthropic 的错误类型与 OpenAI 命名不同，单独一张表
+_ANTHROPIC_ERR_TYPES = {400: "invalid_request_error", 401: "authentication_error",
+                        403: "permission_error", 404: "not_found_error",
+                        411: "invalid_request_error", 413: "request_too_large",
+                        415: "invalid_request_error", 429: "rate_limit_error",
+                        529: "overloaded_error"}
 
 
 def _is_loopback(host: str) -> bool:
@@ -5320,6 +6104,7 @@ def admin_state() -> dict:
             p = dict(_points_state.get(account_id(a)) or {})
         out["points"] = {k: v for k, v in p.items() if k != "at"}
     out["autoCheckin"] = _auto_checkin
+    out["tunables"] = tunables_state()
     out["startup"] = startup_status()
     try:
         out["pool"] = pool_status()
@@ -5355,11 +6140,25 @@ def health() -> dict:
     # 账号池概况：不加 --verbose 也能一眼看出是否还有可用账号
     try:
         st = pool_status()
-        realms = {realm: {"count": st[realm]["count"], "available": st[realm]["available"]}
-                  for realm in REALMS}
+        realms = {
+            realm: {
+                "count": st[realm]["count"],
+                "available": st[realm]["available"],
+                "restricted": st[realm]["restricted"],
+                "paused": st[realm]["risk"]["paused"],
+                "pauseIn": st[realm]["risk"]["remaining"],
+            }
+            for realm in REALMS
+        }
         realms["enabled"] = st["enabled"]
         realms["switches"] = st["stats"].get("switch", 0)
+        realms["restricted"] = sum(st[realm]["restricted"] for realm in REALMS)
+        realms["wavePauses"] = st["stats"].get("wavePauses", 0)
         out["pool"] = realms
+        # 任一区域暂停派发，或成员全部不可用，都提示整体处于降级状态
+        if any(state["paused"] or (state["count"] > 0 and state["available"] == 0)
+               for state in realms.values() if isinstance(state, dict)):
+            out["status"] = "degraded"
     except Exception:  # noqa: BLE001 - 健康检查不能因为池统计出错而失败
         pass
     return out
@@ -5394,13 +6193,9 @@ class Handler(BaseHTTPRequestHandler):
         self._last_error = message
         h = {"Retry-After": retry_after} if retry_after else None
         if self._route() == "/v1/messages":
-            typ = {400: "invalid_request_error", 401: "authentication_error",
-                   403: "permission_error", 404: "not_found_error",
-                   411: "invalid_request_error", 413: "request_too_large",
-                   415: "invalid_request_error", 429: "rate_limit_error",
-                   529: "overloaded_error"}.get(code, "api_error")
             return self._json(code, {"type": "error",
-                                    "error": {"type": typ, "message": message}}, h)
+                                    "error": {"type": _ANTHROPIC_ERR_TYPES.get(code, "api_error"),
+                                              "message": message}}, h)
         etype = etype or _ERR_TYPES.get(code) or ("server_error" if code >= 500 else
                                                   "upstream_error")
         self._json(code, {"error": {"message": message, "type": etype, "param": None,
@@ -5438,6 +6233,15 @@ class Handler(BaseHTTPRequestHandler):
         if auth[:7].lower() == "bearer ":
             auth = auth[7:].strip()
         return _key_eq(auth)
+
+    def _current_account(self, code: int = 400, message: str = "%s",
+                         etype: str = "") -> dict | None:
+        """取当前账号；失败时已经写出错误响应，调用方直接返回即可。"""
+        try:
+            return ensure_auth()
+        except Exception as e:  # noqa: BLE001
+            self._error(code, message % e, etype)
+            return None
 
     def _body(self) -> dict:
         """读取并解析 JSON 体。非对象 / 非法 JSON 返回 None；空体返回 {}。
@@ -5677,18 +6481,18 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin/usage":
                 return self._json(200, usage_summary())
             if path == "/admin/points":
-                try: a = ensure_auth()
-                except Exception as e: return self._error(400, str(e))
+                a = self._current_account()
+                if a is None:
+                    return
                 return self._json(200, account_points(a, True))
             if path == "/admin/startup":
                 return self._json(200, startup_status())
             if path == "/admin/pool":
                 return self._json(200, pool_status())
             if path == "/admin/models":
-                try:
-                    a = ensure_auth()
-                except Exception as e:  # noqa: BLE001
-                    return self._error(400, str(e))
+                a = self._current_account()
+                if a is None:
+                    return
                 # ?refresh=1 强制向上游重新探测，绕过 MODELS_TTL 缓存
                 if self._query("refresh") in ("1", "true", "yes"):
                     cat = _fetch_catalog_locked(a)
@@ -5709,10 +6513,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/models" or path.startswith("/v1/models/"):
             if not self._authorized():
                 return self._error(401, "访问密钥无效", "invalid_request_error")
-            try:
-                a = ensure_auth()
-            except Exception as e:  # noqa: BLE001
-                return self._error(401, "未登录：%s" % e, "authentication_error")
+            a = self._current_account(401, "未登录：%s", "authentication_error")
+            if a is None:
+                return
             models = fetch_models(a)
             if path == "/v1/models":
                 return self._json(200, {"object": "list", "data": models})
@@ -5726,6 +6529,7 @@ class Handler(BaseHTTPRequestHandler):
     def _admin_login_poll(self):
         """网页端轮询登录状态；完成后写凭证并返回账号信息。"""
         global _pending_login
+        replaced = {"status": "expired", "message": "登录会话已被替换，请重新选择版本并登录"}
         # 只在读取/提交共享状态时持锁；轮询上游可能阻塞数十秒，不能占住
         # 登录锁，否则账号切换和新的登录请求都会被无关的网络延迟卡住。
         with _login_lock:
@@ -5734,8 +6538,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"status": "expired",
                                         "message": "登录会话已失效，请重新点击登录"})
             if self._query("state") != ctx["state"]:
-                return self._json(200, {"status": "expired",
-                                        "message": "登录会话已被替换，请重新选择版本并登录"})
+                return self._json(200, replaced)
             if time.time() > ctx["deadline"]:
                 _pending_login = None
                 return self._json(200, {"status": "timeout", "message": "授权超时，请重试"})
@@ -5745,8 +6548,7 @@ class Handler(BaseHTTPRequestHandler):
         if not ok:
             with _login_lock:
                 if _pending_login is not ctx:
-                    return self._json(200, {"status": "expired",
-                                            "message": "登录会话已被替换，请重新选择版本并登录"})
+                    return self._json(200, replaced)
                 if time.time() > ctx["deadline"]:
                     _pending_login = None
                     return self._json(200, {"status": "timeout", "message": "授权超时，请重试"})
@@ -5756,8 +6558,7 @@ class Handler(BaseHTTPRequestHandler):
         # 但先重新确认会话仍是当前会话，避免账号切换后旧轮询覆盖新账号。
         with _login_lock:
             if _pending_login is not ctx:
-                return self._json(200, {"status": "expired",
-                                        "message": "登录会话已被替换，请重新选择版本并登录"})
+                return self._json(200, replaced)
             try:
                 a, acct = login_finish(ctx, tok, AUTH_FILE)
             except Exception as e:
@@ -5793,8 +6594,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         global _inflight
         path = self._route()
+        is_admin = path.startswith("/admin/")
 
-        if path.startswith("/admin/"):
+        if is_admin:
             if not _SERVE_UI:
                 self.close_connection = True
                 return self._error(404, "网页控制台和管理接口已关闭（--no-ui）", "invalid_request_error")
@@ -5814,7 +6616,7 @@ class Handler(BaseHTTPRequestHandler):
         if self._body_err:
             return self._error(*self._body_err)
 
-        if path.startswith("/admin/"):
+        if is_admin:
             # 强制 JSON 类型：跨站 <form>/text/plain 请求无法设置它，又会触发 CORS 预检
             if "application/json" not in (self.headers.get("Content-Type") or "").lower():
                 return self._error(415, "请求类型 Content-Type 必须为 application/json",
@@ -5824,8 +6626,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin/login":
                 return self._admin_login(body.get("realm") or "global")
             if path == "/admin/points/checkin":
-                try: a = ensure_auth()
-                except Exception as e: return self._error(400, str(e))
+                a = self._current_account()
+                if a is None:
+                    return
                 return self._json(200, daily_checkin(a))
             if path == "/admin/settings":
                 if not isinstance(body.get("autoCheckin"), bool):
@@ -5834,6 +6637,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, set_auto_checkin(body["autoCheckin"]))
                 except OSError as e:
                     return self._error(500, "保存自动签到设置失败：" + str(e))
+            if path == "/admin/tunables":
+                try:
+                    return self._json(200, set_tunables(body.get("values")))
+                except ValueError as e:
+                    return self._error(400, str(e), "invalid_request_error")
+                except OSError as e:
+                    return self._error(500, "保存风控参数失败：" + str(e))
             if path == "/admin/startup":
                 if not isinstance(body.get("enabled"), bool) or "autoCheckin" in body:
                     return self._error(400, "自启接口只接受 enabled 布尔值；自动签到请使用设置接口")
@@ -5855,6 +6665,19 @@ class Handler(BaseHTTPRequestHandler):
                 fetch_catalog(a, wait=False)
                 log("已热切换账号：%s（%s）" % (account_name(a) or "未命名账号", REALMS[realm_of(a)]["label"]))
                 return self._json(200, {"ok": True, "state": admin_state()})
+            if path == "/admin/accounts/recheck":
+                aid = body.get("accountId")
+                if not isinstance(aid, str) or not aid.strip():
+                    return self._error(400, "accountId 必须是非空字符串", "invalid_request_error")
+                try:
+                    result = recheck_account_risk(aid.strip())
+                except ValueError as e:
+                    return self._error(400, str(e), "invalid_request_error")
+                except Exception as e:  # noqa: BLE001
+                    return self._error(502, "只读探活失败：%s" % e)
+                result["state"] = admin_state()
+                log("账号复查：%s" % result.get("message", ""))
+                return self._json(200, result)
             if path == "/admin/selection":
                 ids = body.get("models")
                 if "models" in body and (not isinstance(ids, list) or
@@ -5894,10 +6717,9 @@ class Handler(BaseHTTPRequestHandler):
                     "，默认 " + _default_model if _default_model else ""))
                 return self._json(200, saved)
             if path == "/admin/toggle-account-models":
-                try:
-                    a = ensure_auth()
-                except Exception as e:
-                    return self._error(400, str(e))
+                a = self._current_account()
+                if a is None:
+                    return
                 use_account = body.get("useAccountModels")
                 if not isinstance(use_account, bool):
                     return self._error(400, "useAccountModels 必须是布尔值", "invalid_request_error")
@@ -5914,10 +6736,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "useAccountModels": saved["useAccountModels"],
                                         "selected": saved["selected"]})
             if path == "/admin/models/refresh":
-                try:
-                    a = ensure_auth()
-                except Exception as e:  # noqa: BLE001
-                    return self._error(400, str(e))
+                a = self._current_account()
+                if a is None:
+                    return
                 cat = _fetch_catalog_locked(a)
                 return self._json(200, {"models": cat.get("models") or [],
                                         "accountId": account_id(a),
@@ -5927,7 +6748,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if not body:
             return self._error(400, "请求正文为空，或不是有效的 JSON 对象", "invalid_request_error")
-        if not _slots.acquire(timeout=30):
+        # 并发上限可在运行期调整，而调整会替换 _slots 对象。这里先把当前对象
+        # 存成局部变量，释放时归还给它自己——否则在途请求会去释放新信号量，
+        # 触发 BoundedSemaphore 的「释放超过初始值」异常。
+        slots = _slots
+        if not slots.acquire(timeout=30):
             return self._error(429, "并发请求过多（最多 %d 个），请稍后重试" % MAX_INFLIGHT,
                                retry_after="2")
         with _inflight_lock:
@@ -5937,7 +6762,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             with _inflight_lock:
                 _inflight -= 1
-            _slots.release()
+            slots.release()
 
     def _completion(self, path: str, body: dict) -> None:
         self._last_error = ""
@@ -5945,43 +6770,64 @@ class Handler(BaseHTTPRequestHandler):
             validate_request(path, body)
         except ValueError as e:
             return self._error(400, str(e), "invalid_request_error")
-        try:
-            ensure_auth()
-        except Exception as e:  # noqa: BLE001
-            msg = "未登录：%s —— 打开控制台或执行 --setup 登录" % e
-            return self._error(401, msg, "authentication_error")
+        if self._current_account(401, "未登录：%s —— 打开控制台或执行 --setup 登录",
+                                 "authentication_error") is None:
+            return
 
         # 账号池：先按当前账号所在的池挑一个可用成员；池内换号只影响本次请求，
-        # 不改变控制台上的当前账号。
+        # 不改变控制台上的当前账号。风控波次暂停期间只做快速失败，不派发请求。
         session_key = _pool_session_key(self)
         is_resp = path == "/v1/responses"
         prev_owner = None
         if is_resp and isinstance(body.get("previous_response_id"), str) \
                 and body["previous_response_id"]:
             prev_owner = RESP_STORE.owner(body["previous_response_id"])
+
+        # 暂停判定只作用于「按当前地区选号」的普通请求。续接必须回到创建该响应的
+        # 账号，此时当前账号可能已切到另一个地区：拿当前地区的暂停状态去拦续接，
+        # 会在历史账号所在池完全可用时提前失败。续接只看所属账号自己的地区
+        # （见下面的 owner_pause）。
+        current_realm = realm_of(_auth)
+        if not prev_owner:
+            pause = _risk_pause_status(current_realm)
+            if pause.get("paused"):
+                remaining = str(pause["remaining"])
+                if pause.get("reason") == "restricted-wave":
+                    return self._error(
+                        503, "账号池因连续出现账号级限制，已暂停派发（剩余 %s 秒）" % remaining,
+                        retry_after=remaining)
+                return self._error(
+                    429, "上游渠道排队中，账号池短暂退避（剩余 %s 秒）" % remaining,
+                    retry_after=remaining)
         try:
             if prev_owner:
-                # 续接必须回到创建该响应的账号；换个账号会改变上游身份，
-                # 即使请求成功也无法合法取得这段历史。账号 id 本身已按
-                # realm 隔离，这里按历史账号自己的 realm 查找，跨区域切换后
-                # 依然能续接。
                 a = _pool_member(prev_owner)
-                if a is None or not _pool_available(prev_owner):
+                owner_pause = _risk_pause_status(realm_of(a)) if a else {}
+                if a is None or not _pool_available(prev_owner) or owner_pause.get("paused"):
                     return self._error(400, "previous_response_id 所属账号当前不可用",
                                        "invalid_request_error")
             else:
-                a = _pool_pick(realm_of(_auth), session_key) or ensure_auth()
+                a = _pick_request_account(current_realm, session_key)
+                if a is None:
+                    return self._error(503, "该区域没有可用账号（受限、冷却或风控暂停中）")
         except Exception:  # noqa: BLE001 - 池异常时退回原行为
             if prev_owner:
                 return self._error(400, "previous_response_id 所属账号当前不可用",
                                    "invalid_request_error")
-            a = ensure_auth()
+            cur = _auth
+            if cur is None or not _pool_available(account_id(cur)):
+                return self._error(503, "当前账号不可用（受限或冷却中）")
+            a = cur
 
         model, err = resolve_model(body.get("model"), a)
         if err:
             code = 404 if err.startswith("模型 '") else 400
             return self._error(code, err)
         body["model"] = model
+        model_wait = _pool_model_cooldown_remaining(a, model)
+        if model_wait > 0:
+            return self._error(429, "模型 %s 在该账号仍处于上游冷却（剩余 %d 秒）" %
+                               (model, model_wait), retry_after=str(model_wait))
         want_stream = body.get("stream") is True
         is_anthropic = path == "/v1/messages"
         ctx = None
@@ -6005,6 +6851,14 @@ class Handler(BaseHTTPRequestHandler):
         allow_pool_switch = not bool(prev_owner)
         logical_request_id = _uuid7().hex
         resp = None
+
+        def switch_after_failure(cur: dict, failure: dict) -> dict | None:
+            """记录失败并在允许时改投同池账号；返回下一个账号或 None。"""
+            _pool_record_failure(cur, failure, model)
+            if not allow_pool_switch or not _pool_can_switch(cur, failure, tried):
+                return None
+            return _pool_switch(cur, failure, session_key, tried)
+
         try:
             # --- 换号循环：只在写出任何字节之前换号 ---
             while True:
@@ -6015,17 +6869,25 @@ class Handler(BaseHTTPRequestHandler):
                     resp = call_upstream(payload, a)
                 except UpstreamError as e:
                     status = e.status
-                    if allow_pool_switch and _pool_can_switch(a, e.status, tried):
-                        nxt = _pool_switch(a, e.status, e.msg, session_key, tried)
-                        if nxt is not None:
-                            a = nxt
-                            continue
+                    failure = classify_upstream_failure(
+                        e.status, code=e.code, message=e.msg,
+                        retry_after=e.retry_after, request_id=e.request_id,
+                        auth_state=e.auth_state)
+                    nxt = switch_after_failure(a, failure)
+                    if nxt is not None:
+                        a = nxt
+                        continue
                     return self._error(e.status, e.msg, retry_after=e.retry_after)
                 except Exception as e:  # noqa: BLE001
                     status = 502
-                    if allow_pool_switch and getattr(e, "wb2api_retry_safe", False) \
-                            and _pool_can_switch(a, 502, tried):
-                        nxt = _pool_switch(a, 502, str(e), session_key, tried)
+                    # 只有确认请求体未送达上游时才换号重放（建连阶段失败会带
+                    # wb2api_retry_safe）。读到响应前断流、超时等结果未知的情况
+                    # 一律不重放：上游可能已经执行，换号重发会让同一请求跑两次
+                    # 并产生重复计费。此类错误直接交给客户端决定是否重试。
+                    if getattr(e, "wb2api_retry_safe", False):
+                        failure = classify_upstream_failure(
+                            502, message=str(e), request_id=logical_request_id)
+                        nxt = switch_after_failure(a, failure)
                         if nxt is not None:
                             a = nxt
                             continue
@@ -6035,14 +6897,19 @@ class Handler(BaseHTTPRequestHandler):
                 if resp.status >= 400 or not is_sse(resp):
                     ra = resp.headers.get("Retry-After") or ""
                     status, msg, err_code = read_error(resp)
-                    # 日志与池惩罚只记录结构化摘要（含错误码），绝不写入正文。
+                    meta = getattr(resp, "wb2api_error_meta", {}) or {}
+                    rid = _meta_request_id(meta)
+                    failure = classify_upstream_failure(
+                        status, code=err_code, message=msg,
+                        retry_after=ra, request_id=rid)
+                    nxt = switch_after_failure(a, failure)
+                    # 日志与池状态只记录结构化摘要，绝不写入错误正文。
                     safe_reason = _safe_error_summary(status, code=err_code)
-                    log(safe_reason)
-                    if allow_pool_switch and _pool_can_switch(a, status, tried):
-                        nxt = _pool_switch(a, status, safe_reason, session_key, tried)
-                        if nxt is not None:
-                            a = nxt
-                            continue
+                    log("%s [%s]%s" % (safe_reason, failure["label"],
+                                       " request_id=%s" % rid if rid else ""))
+                    if nxt is not None:
+                        a = nxt
+                        continue
                     return self._error(status, msg, retry_after=ra)
                 break
 
@@ -6052,7 +6919,7 @@ class Handler(BaseHTTPRequestHandler):
 
             rid = "resp_" + uuid.uuid4().hex[:24]
             if want_stream:
-                ttft = self._stream(path, resp, model, acc, rid, ctx, t0)
+                ttft = self._stream(path, resp, model, acc, rid, ctx, t0, a)
                 if acc.error:
                     status = acc.error_status or 502
                     self._last_error = acc.error
@@ -6068,6 +6935,10 @@ class Handler(BaseHTTPRequestHandler):
                             out = chat_to_anthropic(acc, model, "msg_" + uuid.uuid4().hex[:24])
                 except UpstreamError as e:
                     status = e.status
+                    failure = classify_upstream_failure(
+                        e.status, code=e.code, message=e.msg,
+                        request_id=e.request_id, auth_state=e.auth_state)
+                    _pool_record_failure(a, failure, model)
                     return self._error(e.status, e.msg)
                 except Exception as e:  # noqa: BLE001
                     status = 502
@@ -6092,7 +6963,7 @@ class Handler(BaseHTTPRequestHandler):
                 if u else ""))
 
     # ---- 流式输出 ----
-    def _stream(self, path: str, resp, model, acc, rid, ctx, t0) -> float | None:
+    def _stream(self, path: str, resp, model, acc, rid, ctx, t0, account=None) -> float | None:
         """返回首字延迟（秒）。"""
         ttft = None
         self._open_stream()
@@ -6110,7 +6981,18 @@ class Handler(BaseHTTPRequestHandler):
                         err = sse_error(obj)
                         if err:
                             # SSE 错误正文可能回显提示词；只保留状态码元数据。
-                            raise UpstreamError(502, _safe_error_summary(502, obj))
+                            meta = _error_log_metadata(obj)
+                            code = meta.get("code")
+                            status = _sse_error_http_status(code)
+                            request_id = _meta_request_id(meta)
+                            summary = _safe_error_summary(status, obj)
+                            if account is not None:
+                                failure = classify_upstream_failure(
+                                    status, code=code, message=summary,
+                                    request_id=request_id)
+                                _pool_record_failure(account, failure, model)
+                            raise UpstreamError(status, summary, code=code,
+                                                request_id=request_id)
                         u = obj.get("usage")
                         if u.__class__ is dict:           # chat 流只需 usage（用量记录），不必累加全文
                             acc.usage = u
@@ -6460,7 +7342,7 @@ class ChineseArgumentParser(argparse.ArgumentParser):
 def main() -> None:
     global _auth, AUTH_FILE, LOCAL_API_KEY, _BIND_HOST, _PORT, _SERVE_UI, HIDE_REASONING
     global DATA_DIR, API_KEY_FILE, SELECTION_FILE, USAGE_FILE, MODELS_CACHE_FILE
-    global _api_key_persisted
+    global RISK_STATE_FILE, _api_key_persisted
 
     ap = ChineseArgumentParser(description="WorkBuddy → OpenAI / Anthropic 兼容极简代理", add_help=False)
     ap._optionals.title = "可选参数"
@@ -6501,6 +7383,7 @@ def main() -> None:
         SELECTION_FILE = _data_path("WB_SELECTION_FILE", "selection.json")
         USAGE_FILE = _data_path("WB_USAGE_FILE", "usage.jsonl")
         MODELS_CACHE_FILE = _data_path("WB_MODELS_CACHE_FILE", "models_cache.json")
+        RISK_STATE_FILE = _data_path("WB_RISK_STATE_FILE", "risk_state.json")
     AUTH_FILE = args.auth or _data_path("WB_AUTH_FILE", "auth.json")
     args.auth = AUTH_FILE
     HIDE_REASONING = args.hide_reasoning
@@ -6519,6 +7402,7 @@ def main() -> None:
         load_accounts()
     except (OSError, ValueError) as e:
         raise SystemExit("读取账号失败：%s" % e)
+    load_risk_state()
     load_selection()
 
     if args.login:
